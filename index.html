@@ -1,0 +1,1979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>WinGo - Color Prediction Game</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>*{margin:0;padding:0;box-sizing:border-box;}body{background:#07071a;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ============================================================
+// IN-MEMORY DATABASE (persists for session)
+// ============================================================
+const DB = {
+  users: {
+    "admin": {
+      id: "USR001", username: "admin", password: "Admin@123",
+      role: "admin", name: "Super Admin", phone: "03001234567",
+      balance: 99999, totalDeposited: 0, totalWithdrawn: 0,
+      totalWon: 0, totalBets: 0, gamesWon: 0,
+      status: "active", createdAt: new Date().toISOString(),
+      loginAttempts: 0, lockedUntil: null, sessions: [],
+      phone: "9876543210"
+    }
+  },
+  transactions: [],
+  bets: [],
+  pendingDeposits: [],
+  pendingWithdrawals: [],
+  gameResults: [],
+  nextUserId: 2,
+  nextTxId: 1,
+  nextBetId: 1,
+};
+
+// Generate random results for history
+for (let i = 0; i < 20; i++) {
+  const n = Math.floor(Math.random() * 10);
+  DB.gameResults.unshift({ period: 20250612000 + i, result: n, timestamp: new Date().toISOString() });
+}
+
+// ============================================================
+// BACKEND VALIDATION ENGINE (runs in browser)
+// ============================================================
+const Backend = {
+  // Security: rate limit tracker
+  _rateLimits: {},
+
+  checkRateLimit(key, maxAttempts = 5, windowMs = 60000) {
+    const now = Date.now();
+    if (!this._rateLimits[key]) this._rateLimits[key] = [];
+    this._rateLimits[key] = this._rateLimits[key].filter(t => now - t < windowMs);
+    if (this._rateLimits[key].length >= maxAttempts) {
+      return { blocked: true, retryAfter: Math.ceil((this._rateLimits[key][0] + windowMs - now) / 1000) };
+    }
+    this._rateLimits[key].push(now);
+    return { blocked: false };
+  },
+
+  // Validation helpers
+  validators: {
+    username: (v) => {
+      if (!v) return "Username is required";
+      if (v.length < 3) return "Min 3 characters";
+      if (v.length > 20) return "Max 20 characters";
+      if (!/^[a-zA-Z0-9_]+$/.test(v)) return "Only letters, numbers, underscore";
+      return null;
+    },
+    password: (v) => {
+      if (!v) return "Password is required";
+      if (v.length < 6) return "Min 6 characters";
+      if (!/[A-Z]/.test(v)) return "Need at least 1 uppercase letter";
+      if (!/[0-9]/.test(v)) return "Need at least 1 number";
+      return null;
+    },
+    phone: (v) => {
+      if (!v) return "Phone is required";
+      const clean = v.replace(/\s/g, "");
+      if (!/^(\+91[6-9]\d{9}|[6-9]\d{9})$/.test(clean)) return "Valid Indian number (+91XXXXXXXXXX or 10 digits starting with 6-9)";
+      return null;
+    },
+    amount: (v, min = 1, max = 500000) => {
+      const n = parseFloat(v);
+      if (isNaN(n) || n <= 0) return "Enter valid amount";
+      if (n < min) return `Minimum ₨${min}`;
+      if (n > max) return `Maximum ₨${max.toLocaleString()}`;
+      return null;
+    },
+  },
+
+  // AUTH
+  register({ username, password, phone, name, referral }) {
+    const errs = {};
+    const uErr = this.validators.username(username);
+    const pErr = this.validators.password(password);
+    const phErr = this.validators.phone(phone);
+    if (uErr) errs.username = uErr;
+    if (pErr) errs.password = pErr;
+    if (phErr) errs.phone = phErr;
+    if (!name || name.trim().length < 2) errs.name = "Full name required (min 2 chars)";
+    if (Object.keys(errs).length) return { ok: false, errors: errs };
+
+    const uLower = username.toLowerCase();
+    if (DB.users[uLower]) return { ok: false, errors: { username: "Username already taken" } };
+    const phoneTaken = Object.values(DB.users).find(u => u.phone === phone.replace(/\s/g, ""));
+    if (phoneTaken) return { ok: false, errors: { phone: "Phone already registered" } };
+
+    const bonus = referral ? 200 : 100;
+    const userId = "USR" + String(DB.nextUserId++).padStart(3, "0");
+    DB.users[uLower] = {
+      id: userId, username: uLower, password, role: "user",
+      name: name.trim(), phone: phone.replace(/\s/g, ""),
+      balance: bonus, totalDeposited: 0, totalWithdrawn: 0,
+      totalWon: 0, totalBets: 0, gamesWon: 0,
+      status: "active", createdAt: new Date().toISOString(),
+      loginAttempts: 0, lockedUntil: null, sessions: [],
+      referral: referral || null
+    };
+    DB.transactions.push({ id: "TX" + DB.nextTxId++, userId, type: "bonus", amount: bonus, note: referral ? "Referral Bonus" : "Welcome Bonus", status: "completed", createdAt: new Date().toISOString() });
+    return { ok: true, user: this._safeUser(DB.users[uLower]) };
+  },
+
+  login({ username, password, ip = "127.0.0.1" }) {
+    const rl = this.checkRateLimit("login_" + ip, 5, 60000);
+    if (rl.blocked) return { ok: false, error: `Too many attempts. Try after ${rl.retryAfter}s` };
+
+    const errs = {};
+    if (!username) errs.username = "Required";
+    if (!password) errs.password = "Required";
+    if (Object.keys(errs).length) return { ok: false, errors: errs };
+
+    const user = DB.users[username.toLowerCase()];
+    if (!user) return { ok: false, error: "Invalid username or password" };
+    if (user.status === "banned") return { ok: false, error: "Account suspended. Contact support." };
+    if (user.lockedUntil && new Date() < new Date(user.lockedUntil)) {
+      const secs = Math.ceil((new Date(user.lockedUntil) - new Date()) / 1000);
+      return { ok: false, error: `Account locked. Try after ${secs}s` };
+    }
+    if (user.password !== password) {
+      user.loginAttempts = (user.loginAttempts || 0) + 1;
+      if (user.loginAttempts >= 5) {
+        user.lockedUntil = new Date(Date.now() + 5 * 60000).toISOString();
+        user.loginAttempts = 0;
+        return { ok: false, error: "Too many failed attempts. Locked for 5 minutes." };
+      }
+      return { ok: false, error: `Wrong password. ${5 - user.loginAttempts} attempts left` };
+    }
+    user.loginAttempts = 0;
+    user.lockedUntil = null;
+    const token = "tok_" + Math.random().toString(36).slice(2) + Date.now();
+    user.sessions.push({ token, ip, createdAt: new Date().toISOString() });
+    return { ok: true, token, user: this._safeUser(user) };
+  },
+
+  // WALLET
+  requestDeposit({ userId, amount, method, txRef }) {
+    const aErr = this.validators.amount(amount, 100, 500000);
+    if (aErr) return { ok: false, error: aErr };
+    if (!method) return { ok: false, error: "Select payment method" };
+    if (!txRef || txRef.trim().length < 4) return { ok: false, error: "Valid transaction reference required" };
+
+    const rl = this.checkRateLimit("deposit_" + userId, 3, 60000);
+    if (rl.blocked) return { ok: false, error: "Too many deposit requests. Wait 1 minute." };
+
+    const dep = { id: "DEP" + DB.nextTxId++, userId, amount: parseFloat(amount), method, txRef: txRef.trim(), status: "pending", createdAt: new Date().toISOString() };
+    DB.pendingDeposits.push(dep);
+    return { ok: true, deposit: dep, message: "Deposit request submitted! Admin will approve shortly." };
+  },
+
+  approveDeposit({ adminId, depositId }) {
+    const admin = Object.values(DB.users).find(u => u.id === adminId);
+    if (!admin || admin.role !== "admin") return { ok: false, error: "Unauthorized" };
+    const dep = DB.pendingDeposits.find(d => d.id === depositId && d.status === "pending");
+    if (!dep) return { ok: false, error: "Deposit not found or already processed" };
+    const user = Object.values(DB.users).find(u => u.id === dep.userId);
+    if (!user) return { ok: false, error: "User not found" };
+    dep.status = "approved";
+    dep.approvedBy = adminId;
+    dep.approvedAt = new Date().toISOString();
+    user.balance += dep.amount;
+    user.totalDeposited += dep.amount;
+    DB.transactions.push({ id: "TX" + DB.nextTxId++, userId: dep.userId, type: "deposit", amount: dep.amount, note: dep.method, status: "completed", createdAt: new Date().toISOString() });
+    return { ok: true, message: `Deposit of ₨${dep.amount} approved for ${user.name}` };
+  },
+
+  rejectDeposit({ adminId, depositId, reason }) {
+    const admin = Object.values(DB.users).find(u => u.id === adminId);
+    if (!admin || admin.role !== "admin") return { ok: false, error: "Unauthorized" };
+    const dep = DB.pendingDeposits.find(d => d.id === depositId && d.status === "pending");
+    if (!dep) return { ok: false, error: "Not found" };
+    dep.status = "rejected";
+    dep.rejectedBy = adminId;
+    dep.rejectReason = reason || "Rejected by admin";
+    return { ok: true, message: "Deposit rejected" };
+  },
+
+  requestWithdrawal({ userId, amount, accountNum, accountName, method }) {
+    const aErr = this.validators.amount(amount, 500, 100000);
+    if (aErr) return { ok: false, error: aErr };
+    if (!accountNum || accountNum.trim().length < 10) return { ok: false, error: "Valid account number required" };
+    if (!accountName || accountName.trim().length < 2) return { ok: false, error: "Account holder name required" };
+    const user = Object.values(DB.users).find(u => u.id === userId);
+    if (!user) return { ok: false, error: "User not found" };
+    if (user.balance < parseFloat(amount)) return { ok: false, error: "Insufficient balance" };
+
+    const rl = this.checkRateLimit("withdraw_" + userId, 2, 300000);
+    if (rl.blocked) return { ok: false, error: "Max 2 withdrawal requests per 5 minutes" };
+
+    user.balance -= parseFloat(amount);
+    const wit = { id: "WIT" + DB.nextTxId++, userId, amount: parseFloat(amount), accountNum: accountNum.trim(), accountName: accountName.trim(), method: method || "EasyPaisa", status: "pending", createdAt: new Date().toISOString() };
+    DB.pendingWithdrawals.push(wit);
+    DB.transactions.push({ id: "TX" + DB.nextTxId++, userId, type: "withdrawal", amount: parseFloat(amount), note: "Withdrawal request", status: "pending", createdAt: new Date().toISOString() });
+    return { ok: true, message: "Withdrawal request submitted! Processing within 24 hours." };
+  },
+
+  // BET
+  placeBet({ userId, betType, betValue, amount, period }) {
+    const aErr = this.validators.amount(amount, 1, 100000);
+    if (aErr) return { ok: false, error: aErr };
+    const user = Object.values(DB.users).find(u => u.id === userId);
+    if (!user) return { ok: false, error: "User not found" };
+    if (user.status === "banned") return { ok: false, error: "Account suspended" };
+    if (user.balance < parseFloat(amount)) return { ok: false, error: "Insufficient balance. Please deposit." };
+    if (!["color", "number"].includes(betType)) return { ok: false, error: "Invalid bet type" };
+    if (betType === "number" && (betValue < 0 || betValue > 9)) return { ok: false, error: "Number must be 0-9" };
+    if (betType === "color" && !["green", "red", "violet"].includes(betValue)) return { ok: false, error: "Invalid color" };
+
+    const existing = DB.bets.find(b => b.userId === userId && b.period === period && b.status === "pending");
+    if (existing) return { ok: false, error: "Already bet this round! Wait for next period." };
+
+    user.balance -= parseFloat(amount);
+    user.totalBets += parseFloat(amount);
+    const bet = { id: "BET" + DB.nextBetId++, userId, betType, betValue, amount: parseFloat(amount), period, status: "pending", createdAt: new Date().toISOString() };
+    DB.bets.push(bet);
+    return { ok: true, bet, newBalance: user.balance };
+  },
+
+  settleBet({ betId, result }) {
+    const bet = DB.bets.find(b => b.id === betId);
+    if (!bet || bet.status !== "pending") return;
+    const user = Object.values(DB.users).find(u => u.id === bet.userId);
+    if (!user) return;
+
+    const numColor = (n) => n === 0 || n === 5 ? "violet" : [1,3,7,9].includes(n) ? "green" : "red";
+    const resColor = numColor(result);
+    let won = false, multiplier = 0;
+
+    if (bet.betType === "number" && bet.betValue === result) { won = true; multiplier = 9; }
+    else if (bet.betType === "color" && bet.betValue === resColor) { won = true; multiplier = bet.betValue === "violet" ? 4.6 : 2; }
+
+    const winAmount = won ? Math.round(bet.amount * multiplier) : 0;
+    bet.status = "settled";
+    bet.result = result;
+    bet.resultColor = resColor;
+    bet.won = won;
+    bet.winAmount = winAmount;
+    bet.settledAt = new Date().toISOString();
+
+    if (won) {
+      user.balance += winAmount;
+      user.totalWon += winAmount;
+      user.gamesWon++;
+      DB.transactions.push({ id: "TX" + DB.nextTxId++, userId: bet.userId, type: "win", amount: winAmount, note: `Won on ${bet.betType} ${bet.betValue}`, status: "completed", createdAt: new Date().toISOString() });
+    }
+    return { won, winAmount, resultColor: resColor, result };
+  },
+
+  // ADMIN
+  getAllUsers(adminId) {
+    const admin = Object.values(DB.users).find(u => u.id === adminId);
+    if (!admin || admin.role !== "admin") return { ok: false, error: "Unauthorized" };
+    return { ok: true, users: Object.values(DB.users).map(u => this._safeUser(u)) };
+  },
+
+  banUser({ adminId, targetUserId }) {
+    const admin = Object.values(DB.users).find(u => u.id === adminId);
+    if (!admin || admin.role !== "admin") return { ok: false, error: "Unauthorized" };
+    const target = Object.values(DB.users).find(u => u.id === targetUserId);
+    if (!target) return { ok: false, error: "User not found" };
+    if (target.role === "admin") return { ok: false, error: "Cannot ban admin" };
+    target.status = target.status === "banned" ? "active" : "banned";
+    return { ok: true, message: `User ${target.status === "banned" ? "banned" : "unbanned"}`, newStatus: target.status };
+  },
+
+  adjustBalance({ adminId, targetUserId, amount, note }) {
+    const admin = Object.values(DB.users).find(u => u.id === adminId);
+    if (!admin || admin.role !== "admin") return { ok: false, error: "Unauthorized" };
+    const target = Object.values(DB.users).find(u => u.id === targetUserId);
+    if (!target) return { ok: false, error: "User not found" };
+    const amt = parseFloat(amount);
+    if (isNaN(amt)) return { ok: false, error: "Invalid amount" };
+    target.balance = Math.max(0, target.balance + amt);
+    DB.transactions.push({ id: "TX" + DB.nextTxId++, userId: targetUserId, type: amt > 0 ? "admin_credit" : "admin_debit", amount: Math.abs(amt), note: note || "Admin adjustment", status: "completed", createdAt: new Date().toISOString() });
+    return { ok: true, newBalance: target.balance };
+  },
+
+  getStats(adminId) {
+    const admin = Object.values(DB.users).find(u => u.id === adminId);
+    if (!admin || admin.role !== "admin") return { ok: false, error: "Unauthorized" };
+    const users = Object.values(DB.users);
+    return {
+      ok: true,
+      stats: {
+        totalUsers: users.filter(u => u.role !== "admin").length,
+        activeUsers: users.filter(u => u.status === "active" && u.role !== "admin").length,
+        bannedUsers: users.filter(u => u.status === "banned").length,
+        totalBets: DB.bets.length,
+        totalTransactions: DB.transactions.length,
+        pendingDeposits: DB.pendingDeposits.filter(d => d.status === "pending").length,
+        pendingWithdrawals: DB.pendingWithdrawals.filter(w => w.status === "pending").length,
+        totalBalance: users.reduce((s, u) => s + u.balance, 0),
+        houseProfit: DB.bets.filter(b => b.status === "settled" && !b.won).reduce((s, b) => s + b.amount, 0),
+      }
+    };
+  },
+
+  getUserTransactions(userId) {
+    return DB.transactions.filter(t => t.userId === userId).slice(-50).reverse();
+  },
+
+  _safeUser(u) {
+    const { password, sessions, loginAttempts, lockedUntil, ...safe } = u;
+    return safe;
+  }
+};
+
+// ============================================================
+// STYLES
+// ============================================================
+const S = {
+  vars: `
+    :root {
+      --bg:#07071a; --bg2:#0d0d28; --card:#111133; --card2:#181845;
+      --accent:#f0c000; --green:#00e676; --red:#ff1744; --violet:#b040ff;
+      --blue:#00b0ff; --text:#eeeeff; --muted:#6666aa; --border:#222255;
+      --danger:#ff1744; --success:#00e676;
+    }
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;min-height:100vh;}
+    input,select{font-family:inherit;}
+    ::-webkit-scrollbar{width:4px;}
+    ::-webkit-scrollbar-track{background:var(--bg2);}
+    ::-webkit-scrollbar-thumb{background:var(--accent);border-radius:2px;}
+  `,
+};
+
+// ============================================================
+// COMPONENTS
+// ============================================================
+
+function Notif({ notif }) {
+  if (!notif) return null;
+  const colors = { success: "#00e676", error: "#ff1744", info: "#00b0ff", warn: "#f0c000" };
+  return (
+    <div style={{ position:"fixed", top:70, right:20, zIndex:9999, padding:"14px 22px",
+      background: colors[notif.type] || "#00e676", color: notif.type === "success" || notif.type === "warn" ? "#000" : "#fff",
+      borderRadius:12, fontWeight:700, fontSize:14, maxWidth:320, boxShadow:"0 8px 30px rgba(0,0,0,0.5)",
+      animation:"slideIn .3s ease" }}>
+      {notif.msg}
+    </div>
+  );
+}
+
+function FieldError({ err }) {
+  if (!err) return null;
+  return <div style={{ color:"#ff5555", fontSize:12, marginTop:4 }}>⚠ {err}</div>;
+}
+
+function Spinner() {
+  return <span style={{ display:"inline-block", width:16, height:16, border:"2px solid rgba(255,255,255,0.3)",
+    borderTopColor:"#fff", borderRadius:"50%", animation:"spin 0.7s linear infinite", marginLeft:8 }} />;
+}
+
+// ============================================================
+// PHONE INPUT with live validation
+// ============================================================
+function PhoneInput({ value, onChange, error }) {
+  const [touched, setTouched] = useState(false);
+  const clean = (value || "").replace(/\s/g, "");
+  const isValid = /^(\+91[6-9]\d{9}|[6-9]\d{9})$/.test(clean);
+  const showOk = touched && clean.length > 0 && isValid;
+  const showErr = touched && clean.length > 0 && !isValid;
+
+  let hint = "";
+  if (touched && clean.length > 0 && !isValid) {
+    if (clean.startsWith("+91")) {
+      const digits = clean.slice(3);
+      if (digits.length < 10) hint = `${10 - digits.length} more digits needed`;
+      else if (!/^[6-9]/.test(digits)) hint = "Must start with 6, 7, 8 or 9";
+    } else if (/^\d+$/.test(clean)) {
+      if (clean.length < 10) hint = `${10 - clean.length} more digits needed`;
+      else if (!/^[6-9]/.test(clean)) hint = "Must start with 6, 7, 8 or 9";
+    }
+  }
+
+  return (
+    <div style={{ marginBottom:16 }}>
+      <div style={{ position:"relative" }}>
+        <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", fontSize:16 }}>📱</span>
+        <input
+          type="tel"
+          placeholder="+91XXXXXXXXXX or 10-digit number"
+          value={value || ""}
+          onChange={e => { onChange(e.target.value); }}
+          onBlur={() => setTouched(true)}
+          maxLength={14}
+          style={{
+            width:"100%", background:"var(--bg2)",
+            border:`1px solid ${showErr || error ? "#ff5555" : showOk ? "#00e676" : "var(--border)"}`,
+            borderRadius:10, padding:"13px 40px 13px 42px", color:"var(--text)", fontSize:15, outline:"none", transition:"border-color .2s"
+          }}
+        />
+        <span style={{ position:"absolute", right:14, top:"50%", transform:"translateY(-50%)", fontSize:16 }}>
+          {showOk ? "✅" : showErr ? "❌" : ""}
+        </span>
+      </div>
+      {showErr && !hint && <div style={{ color:"#ff5555", fontSize:12, marginTop:4 }}>⚠ Valid Indian number required (+91XXXXXXXXXX)</div>}
+      {hint && <div style={{ color: showErr ? "#ff5555" : "var(--muted)", fontSize:12, marginTop:4 }}>📝 {hint}</div>}
+      {error && !touched && <FieldError err={error} />}
+    </div>
+  );
+}
+
+// ============================================================
+// AUTH PAGE
+// ============================================================
+function AuthPage({ onLogin }) {
+  const [tab, setTab] = useState("login");
+  const [form, setForm] = useState({});
+  const [errs, setErrs] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [serverErr, setServerErr] = useState("");
+  const [showPass, setShowPass] = useState(false);
+
+  const set = (k, v) => { setForm(f => ({ ...f, [k]: v })); setErrs(e => ({ ...e, [k]: null })); setServerErr(""); };
+
+  // Live field validation hints
+  const usernameHint = form.username
+    ? form.username.length < 3 ? "Too short" : form.username.length > 20 ? "Too long" : !/^[a-zA-Z0-9_]+$/.test(form.username) ? "Letters/numbers/underscore only" : null
+    : null;
+  const passwordHint = tab === "register" && form.password
+    ? !form.password.match(/[A-Z]/) ? "Add 1 uppercase letter" : !form.password.match(/[0-9]/) ? "Add 1 number" : form.password.length < 6 ? "Too short" : null
+    : null;
+  const passStrength = !form.password ? 0 : form.password.length >= 8 && /[A-Z]/.test(form.password) && /[0-9]/.test(form.password) && /[^a-zA-Z0-9]/.test(form.password) ? 4 : form.password.length >= 6 && /[A-Z]/.test(form.password) && /[0-9]/.test(form.password) ? 3 : form.password.length >= 6 ? 2 : 1;
+  const strengthLabel = ["","Weak","Fair","Good","Strong"];
+  const strengthColor = ["","#ff5555","#f0c000","#00b0ff","#00e676"];
+
+  async function handleLogin() {
+    setLoading(true);
+    await new Promise(r => setTimeout(r, 600));
+    const res = Backend.login({ username: form.username || "", password: form.password || "" });
+    setLoading(false);
+    if (!res.ok) { res.errors ? setErrs(res.errors) : setServerErr(res.error); return; }
+    onLogin(res.user, res.token);
+  }
+
+  async function handleRegister() {
+    setLoading(true);
+    await new Promise(r => setTimeout(r, 700));
+    const res = Backend.register({ username: form.username, password: form.password, phone: form.phone, name: form.name, referral: form.referral });
+    setLoading(false);
+    if (!res.ok) { setErrs(res.errors || {}); return; }
+    const loginRes = Backend.login({ username: form.username, password: form.password });
+    onLogin(loginRes.user, loginRes.token);
+  }
+
+  const inp = (placeholder, key, type = "text", icon = "") => (
+    <div style={{ marginBottom:16 }}>
+      <div style={{ position:"relative" }}>
+        {icon && <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", fontSize:15 }}>{icon}</span>}
+        <input type={key === "password" ? (showPass ? "text" : "password") : type}
+          placeholder={placeholder} value={form[key] || ""}
+          onChange={e => set(key, e.target.value)}
+          onKeyDown={e => e.key === "Enter" && (tab === "login" ? handleLogin() : handleRegister())}
+          style={{ width:"100%", background:"var(--bg2)", border:`1px solid ${errs[key] ? "#ff5555" : "var(--border)"}`,
+            borderRadius:10, padding:`13px ${key==="password"?"42px":"16px"} 13px ${icon?"42px":"16px"}`,
+            color:"var(--text)", fontSize:15, outline:"none", transition:"border-color .2s" }} />
+        {key === "password" && (
+          <span onClick={() => setShowPass(s=>!s)}
+            style={{ position:"absolute", right:14, top:"50%", transform:"translateY(-50%)", cursor:"pointer", fontSize:16, userSelect:"none" }}>
+            {showPass ? "🙈" : "👁"}
+          </span>
+        )}
+      </div>
+      <FieldError err={errs[key]} />
+    </div>
+  );
+
+  return (
+    <div style={{ minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", padding:16,
+      background:"radial-gradient(ellipse at 20% 50%, rgba(176,64,255,.15) 0%, transparent 50%), radial-gradient(ellipse at 80% 20%, rgba(240,192,0,.1) 0%, transparent 50%), var(--bg)" }}>
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:20, padding:"36px 32px",
+        width:"100%", maxWidth:420, position:"relative", overflow:"hidden" }}>
+        <div style={{ position:"absolute", top:0, left:0, right:0, height:3,
+          background:"linear-gradient(90deg, var(--violet), var(--accent), var(--green))" }} />
+
+        <div style={{ textAlign:"center", marginBottom:28 }}>
+          <div style={{ fontFamily:"monospace", fontSize:36, fontWeight:900, letterSpacing:6,
+            background:"linear-gradient(135deg,var(--accent),var(--violet))", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>
+            WINGO
+          </div>
+          <div style={{ color:"var(--muted)", fontSize:13, marginTop:5 }}>🇮🇳 India's #1 Color Prediction</div>
+        </div>
+
+        <div style={{ display:"flex", marginBottom:24, border:"1px solid var(--border)", borderRadius:10, overflow:"hidden" }}>
+          {["login","register"].map(t => (
+            <div key={t} onClick={() => { setTab(t); setErrs({}); setServerErr(""); setForm({}); }}
+              style={{ flex:1, padding:"11px 0", textAlign:"center", cursor:"pointer", fontWeight:700, fontSize:14,
+                letterSpacing:2, background: tab===t ? "linear-gradient(135deg,var(--violet),#7000cc)" : "transparent",
+                color: tab===t ? "#fff" : "var(--muted)", transition:"all .25s" }}>
+              {t === "login" ? "🔑 LOGIN" : "📝 REGISTER"}
+            </div>
+          ))}
+        </div>
+
+        {serverErr && (
+          <div style={{ background:"rgba(255,23,68,.12)", border:"1px solid rgba(255,23,68,.4)", borderRadius:10,
+            padding:"10px 14px", color:"#ff8888", fontSize:13, marginBottom:16, display:"flex", alignItems:"center", gap:8 }}>
+            🔒 {serverErr}
+          </div>
+        )}
+
+        {tab === "login" ? (
+          <>
+            {inp("Username", "username", "text", "👤")}
+            {inp("Password", "password", "password", "🔒")}
+            <div style={{ color:"var(--muted)", fontSize:12, marginBottom:16, textAlign:"right" }}>
+              Demo: <strong style={{color:"var(--accent)"}}>admin / Admin@123</strong>
+            </div>
+          </>
+        ) : (
+          <>
+            {inp("Full Name", "name", "text", "🧑")}
+
+            {/* Username with live hint */}
+            <div style={{ marginBottom:16 }}>
+              <div style={{ position:"relative" }}>
+                <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", fontSize:15 }}>👤</span>
+                <input type="text" placeholder="Username (3-20 chars)" value={form.username || ""}
+                  onChange={e => set("username", e.target.value)}
+                  style={{ width:"100%", background:"var(--bg2)", border:`1px solid ${errs.username?"#ff5555":form.username&&!usernameHint?"#00e676":"var(--border)"}`,
+                    borderRadius:10, padding:"13px 16px 13px 42px", color:"var(--text)", fontSize:15, outline:"none" }} />
+                {form.username && <span style={{ position:"absolute", right:14, top:"50%", transform:"translateY(-50%)", fontSize:14 }}>{usernameHint ? "❌" : "✅"}</span>}
+              </div>
+              {usernameHint && <div style={{ color:"#f0c000", fontSize:12, marginTop:4 }}>⚠ {usernameHint}</div>}
+              <FieldError err={errs.username} />
+            </div>
+
+            {/* Phone with live validation */}
+            <PhoneInput value={form.phone} onChange={v => set("phone", v)} error={errs.phone} />
+
+            {/* Password with strength meter */}
+            <div style={{ marginBottom:16 }}>
+              <div style={{ position:"relative" }}>
+                <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", fontSize:15 }}>🔒</span>
+                <input type={showPass ? "text" : "password"} placeholder="Password (min 6, 1 uppercase, 1 number)"
+                  value={form.password || ""} onChange={e => set("password", e.target.value)}
+                  style={{ width:"100%", background:"var(--bg2)", border:`1px solid ${errs.password?"#ff5555":"var(--border)"}`,
+                    borderRadius:10, padding:"13px 42px 13px 42px", color:"var(--text)", fontSize:15, outline:"none" }} />
+                <span onClick={() => setShowPass(s=>!s)}
+                  style={{ position:"absolute", right:14, top:"50%", transform:"translateY(-50%)", cursor:"pointer", fontSize:16 }}>
+                  {showPass ? "🙈" : "👁"}
+                </span>
+              </div>
+              {form.password && (
+                <div style={{ marginTop:6 }}>
+                  <div style={{ display:"flex", gap:3 }}>
+                    {[1,2,3,4].map(i => (
+                      <div key={i} style={{ flex:1, height:3, borderRadius:99, transition:"background .3s",
+                        background: passStrength >= i ? strengthColor[passStrength] : "var(--border)" }} />
+                    ))}
+                  </div>
+                  <div style={{ fontSize:11, color:strengthColor[passStrength], marginTop:3, fontWeight:700 }}>
+                    {strengthLabel[passStrength]} password {passwordHint ? `— ${passwordHint}` : passStrength >= 3 ? "✓" : ""}
+                  </div>
+                </div>
+              )}
+              <FieldError err={errs.password} />
+            </div>
+
+            {inp("Referral Code (optional +₨100 bonus)", "referral", "text", "🎁")}
+          </>
+        )}
+
+        <button onClick={tab === "login" ? handleLogin : handleRegister} disabled={loading}
+          style={{ width:"100%", padding:"15px 0", border:"none", borderRadius:10, cursor:loading?"not-allowed":"pointer",
+            background:"linear-gradient(135deg,var(--accent),#cc9900)", color:"#000",
+            fontFamily:"monospace", fontSize:14, fontWeight:900, letterSpacing:3,
+            opacity: loading ? .7 : 1, display:"flex", alignItems:"center", justifyContent:"center" }}>
+          {tab === "login" ? "🔑 LOGIN" : "🚀 CREATE ACCOUNT"}{loading && <Spinner />}
+        </button>
+
+        {tab === "register" && (
+          <div style={{ textAlign:"center", marginTop:14, fontSize:12, color:"var(--muted)" }}>
+            By registering you agree to our Terms & Conditions
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// GAME ENGINE
+// ============================================================
+function useGameEngine(user, token, showNotif, refreshUser) {
+  const [timer, setTimer] = useState(30);
+  const [period, setPeriod] = useState(DB.gameResults[0]?.period + 1 || 20250612021);
+  const [results, setResults] = useState(DB.gameResults.slice(0, 15));
+  const [currentBet, setCurrentBet] = useState(null);
+  const [lastResult, setLastResult] = useState(DB.gameResults[0]);
+  const timerRef = useRef(null);
+
+  const endRound = useCallback(() => {
+    const result = Math.floor(Math.random() * 10);
+    const numColor = (n) => n === 0 || n === 5 ? "violet" : [1,3,7,9].includes(n) ? "green" : "red";
+    const newEntry = { period, result, color: numColor(result), timestamp: new Date().toISOString() };
+    DB.gameResults.unshift(newEntry);
+    setLastResult(newEntry);
+    setResults(DB.gameResults.slice(0, 15));
+
+    if (currentBet) {
+      const settlement = Backend.settleBet({ betId: currentBet.id, result });
+      if (settlement) {
+        if (settlement.won) showNotif(`🎉 WIN! +₨${settlement.winAmount.toLocaleString()}`, "success");
+        else showNotif(`❌ Lost ₨${currentBet.amount}`, "error");
+        refreshUser();
+      }
+      setCurrentBet(null);
+    }
+    setPeriod(p => p + 1);
+  }, [period, currentBet, showNotif, refreshUser]);
+
+  useEffect(() => {
+    timerRef.current = setInterval(() => {
+      setTimer(t => {
+        if (t <= 1) { endRound(); return 30; }
+        return t - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timerRef.current);
+  }, [endRound]);
+
+  const placeBet = (betType, betValue, amount) => {
+    if (!user) return;
+    const res = Backend.placeBet({ userId: user.id, betType, betValue, amount, period });
+    if (!res.ok) { showNotif(res.error, "error"); return false; }
+    setCurrentBet(res.bet);
+    refreshUser();
+    showNotif(`✅ Bet placed! ₨${amount} on ${betType === "color" ? betValue.toUpperCase() : "Number " + betValue}`, "info");
+    return true;
+  };
+
+  return { timer, period, results, lastResult, currentBet, placeBet };
+}
+
+// ============================================================
+// WINGO GAME PAGE
+// ============================================================
+function GamePage({ user, token, showNotif, refreshUser }) {
+  const { timer, period, results, lastResult, currentBet, placeBet } = useGameEngine(user, token, showNotif, refreshUser);
+  const [selectedBet, setSelectedBet] = useState(null);
+  const [amount, setAmount] = useState(100);
+  const [amountErr, setAmountErr] = useState("");
+
+  const numColor = (n) => n === 0 || n === 5 ? "violet" : [1,3,7,9].includes(n) ? "green" : "red";
+  const colorMap = { green: "linear-gradient(135deg,#00b341,#00e676)", red: "linear-gradient(135deg,#a80000,#ff1744)", violet: "linear-gradient(135deg,#6a00bb,#b040ff)" };
+  const ballStyle = (n) => {
+    const c = numColor(n);
+    return { width:32, height:32, borderRadius:"50%", display:"flex", alignItems:"center", justifyContent:"center",
+      background: colorMap[c], color: c === "green" ? "#000" : "#fff", fontSize:13, fontWeight:900 };
+  };
+  const timerColor = timer <= 5 ? "var(--red)" : timer <= 10 ? "#f0c000" : "var(--accent)";
+
+  const handlePlaceBet = () => {
+    const err = Backend.validators.amount(amount, 1, 100000);
+    if (err) { setAmountErr(err); return; }
+    if (!selectedBet) { showNotif("Select a color or number first!", "warn"); return; }
+    if (currentBet) { showNotif("Already bet this round!", "warn"); return; }
+    if (timer <= 5) { showNotif("Betting closed for this round!", "warn"); return; }
+    setAmountErr("");
+    placeBet(selectedBet.type, selectedBet.value, parseFloat(amount));
+  };
+
+  const myBets = DB.bets.filter(b => b.userId === user.id).slice(-10).reverse();
+
+  return (
+    <div style={{ maxWidth:720, margin:"0 auto", padding:20 }}>
+      {/* Timer Card */}
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:20,
+        marginBottom:16, display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:16 }}>
+        <div>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2 }}>PERIOD</div>
+          <div style={{ fontFamily:"monospace", fontSize:18, fontWeight:700, color:"var(--accent)" }}>
+            {String(period).padStart(11, "0")}
+          </div>
+        </div>
+        <div style={{ textAlign:"center" }}>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:6 }}>TIME LEFT</div>
+          <div style={{ fontFamily:"monospace", fontSize:42, fontWeight:900, color:timerColor, lineHeight:1,
+            textShadow:`0 0 20px ${timerColor}` }}>
+            {String(Math.floor(timer / 60)).padStart(2,"0")}:{String(timer % 60).padStart(2,"0")}
+          </div>
+        </div>
+        <div style={{ textAlign:"right" }}>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:6 }}>LAST</div>
+          {lastResult && (
+            <div style={{ ...ballStyle(lastResult.result), width:44, height:44, fontSize:20, marginLeft:"auto" }}>
+              {lastResult.result}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* History */}
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:16, marginBottom:16 }}>
+        <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:10 }}>RECENT RESULTS</div>
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+          {results.map((r, i) => <div key={i} style={ballStyle(r.result)}>{r.result}</div>)}
+        </div>
+      </div>
+
+      {/* Game Chart */}
+      <GameChart userId={user.id} />
+
+      {/* Color Bets */}
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:16, marginBottom:16 }}>
+        <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:12 }}>SELECT COLOR</div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12 }}>
+          {[{k:"green",label:"GREEN",mult:"2x"},{k:"violet",label:"VIOLET",mult:"4.6x"},{k:"red",label:"RED",mult:"2x"}].map(c => (
+            <button key={c.k} onClick={() => setSelectedBet({ type:"color", value:c.k })}
+              style={{ padding:"16px 8px", borderRadius:12, border: selectedBet?.value === c.k ? "2px solid #fff" : "2px solid transparent",
+                background: colorMap[c.k], cursor:"pointer", fontFamily:"monospace", fontSize:13, fontWeight:900,
+                color: c.k === "green" ? "#000" : "#fff", letterSpacing:1, transform: selectedBet?.value===c.k ? "scale(1.04)" : "scale(1)",
+                transition:"all .2s" }}>
+              {c.label}<br /><span style={{ fontSize:11, opacity:.8 }}>WIN {c.mult}</span>
+            </button>
+          ))}
+        </div>
+
+        <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, margin:"16px 0 10px" }}>SELECT NUMBER</div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:10 }}>
+          {[0,1,2,3,4,5,6,7,8,9].map(n => {
+            const c = numColor(n);
+            const borderColors = { green:"var(--green)", red:"var(--red)", violet:"var(--violet)" };
+            const sel = selectedBet?.type === "number" && selectedBet?.value === n;
+            return (
+              <button key={n} onClick={() => setSelectedBet({ type:"number", value:n })}
+                style={{ aspectRatio:1, borderRadius:"50%", border:`2px solid ${borderColors[c]}`,
+                  background: sel ? (c==="green"?"rgba(0,230,118,.2)":c==="red"?"rgba(255,23,68,.2)":"rgba(176,64,255,.2)") : "var(--bg2)",
+                  cursor:"pointer", fontFamily:"monospace", fontSize:18, fontWeight:900, color:borderColors[c],
+                  transform: sel ? "scale(1.12)" : "scale(1)", transition:"all .2s" }}>
+                {n}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Bet Amount */}
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:16, marginBottom:16 }}>
+        <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:12 }}>BET AMOUNT</div>
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:12 }}>
+          {[1,5,10,50,100,500,1000].map(v => (
+            <button key={v} onClick={() => { setAmount(v); setAmountErr(""); }}
+              style={{ padding:"8px 14px", borderRadius:8, border:`1px solid ${amount===v?"var(--accent)":"var(--border)"}`,
+                background: amount===v ? "rgba(240,192,0,.1)" : "var(--bg2)", color: amount===v ? "var(--accent)" : "var(--muted)",
+                cursor:"pointer", fontSize:13, fontWeight:600 }}>
+              ₨{v >= 1000 ? v/1000+"K" : v}
+            </button>
+          ))}
+        </div>
+        <div style={{ display:"flex", gap:10 }}>
+          <div style={{ flex:1 }}>
+            <input type="number" value={amount} onChange={e => { setAmount(e.target.value); setAmountErr(""); }}
+              min={1} placeholder="Enter amount (min ₨1)"
+              style={{ width:"100%", background:"var(--bg2)", border:`1px solid ${amountErr?"#ff5555":"var(--border)"}`,
+                borderRadius:10, padding:"12px 14px", color:"var(--text)", fontSize:16, fontFamily:"monospace",
+                fontWeight:700, outline:"none" }} />
+            <FieldError err={amountErr} />
+          </div>
+          <button onClick={handlePlaceBet} disabled={!!currentBet || timer <= 5}
+            style={{ padding:"12px 22px", borderRadius:10, border:"none", cursor: (currentBet || timer<=5) ? "not-allowed":"pointer",
+              background: currentBet || timer<=5 ? "var(--border)" : "linear-gradient(135deg,var(--accent),#cc9900)",
+              color: currentBet || timer<=5 ? "var(--muted)":"#000", fontFamily:"monospace", fontSize:13, fontWeight:900,
+              letterSpacing:1, whiteSpace:"nowrap" }}>
+            {currentBet ? "✓ BET PLACED" : timer <= 5 ? "CLOSED" : "PLACE BET"}
+          </button>
+        </div>
+        <div style={{ marginTop:10, fontSize:13, color:"var(--muted)" }}>
+          Selected: <span style={{ color:"var(--accent)", fontWeight:700 }}>
+            {selectedBet ? (selectedBet.type === "color" ? selectedBet.value.toUpperCase() : "Number " + selectedBet.value) : "None"}
+          </span>
+          &nbsp;|&nbsp; Balance: <span style={{ color:"var(--accent)", fontFamily:"monospace", fontWeight:700 }}>
+            ₨{(Object.values(DB.users).find(u => u.id === user.id)?.balance || 0).toLocaleString()}
+          </span>
+        </div>
+      </div>
+
+      {/* My Bets */}
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:16 }}>
+        <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:12 }}>MY BET HISTORY</div>
+        {myBets.length === 0 ? (
+          <div style={{ textAlign:"center", color:"var(--muted)", padding:20, fontSize:14 }}>No bets yet — place your first bet!</div>
+        ) : (
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+            <thead>
+              <tr>{["PERIOD","SELECTION","AMOUNT","RESULT","P&L"].map(h => (
+                <th key={h} style={{ padding:"8px 6px", textAlign:"left", color:"var(--muted)", fontSize:11, letterSpacing:1, borderBottom:"1px solid var(--border)" }}>{h}</th>
+              ))}</tr>
+            </thead>
+            <tbody>
+              {myBets.map(b => (
+                <tr key={b.id}>
+                  <td style={{ padding:"8px 6px", fontSize:11 }}>{b.period}</td>
+                  <td style={{ padding:"8px 6px", fontWeight:700 }}>{b.betType === "color" ? b.betValue.toUpperCase() : "NUM " + b.betValue}</td>
+                  <td style={{ padding:"8px 6px" }}>₨{b.amount}</td>
+                  <td style={{ padding:"8px 6px" }}>{b.status === "pending" ? <span style={{color:"var(--accent)"}}>Pending...</span> : `${b.result} (${b.resultColor?.toUpperCase()})`}</td>
+                  <td style={{ padding:"8px 6px", fontFamily:"monospace", fontWeight:900, color: b.status==="pending" ? "var(--muted)" : b.won ? "var(--green)" : "var(--red)" }}>
+                    {b.status === "pending" ? "—" : b.won ? `+₨${b.winAmount}` : `-₨${b.amount}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// WALLET PAGE
+// ============================================================
+function WalletPage({ user, showNotif, refreshUser }) {
+  const [depForm, setDepForm] = useState({ amount:"", method:"EasyPaisa", txRef:"" });
+  const [witForm, setWitForm] = useState({ amount:"", accountNum:"", accountName:"", method:"EasyPaisa" });
+  const [depErrs, setDepErrs] = useState({});
+  const [witErrs, setWitErrs] = useState({});
+  const [tab, setTab] = useState("deposit");
+  const [loading, setLoading] = useState(false);
+
+  const liveUser = Object.values(DB.users).find(u => u.id === user.id);
+  const txs = Backend.getUserTransactions(user.id);
+
+  const handleDeposit = async () => {
+    const errs = {};
+    const aErr = Backend.validators.amount(depForm.amount, 100);
+    if (aErr) errs.amount = aErr;
+    if (!depForm.txRef || depForm.txRef.trim().length < 4) errs.txRef = "Reference must be at least 4 characters";
+    setDepErrs(errs);
+    if (Object.keys(errs).length) return;
+    setLoading(true);
+    await new Promise(r => setTimeout(r, 800));
+    const res = Backend.requestDeposit({ userId: user.id, ...depForm });
+    setLoading(false);
+    if (!res.ok) { showNotif(res.error, "error"); return; }
+    showNotif(res.message, "success");
+    setDepForm({ amount:"", method:"EasyPaisa", txRef:"" });
+    refreshUser();
+  };
+
+  const handleWithdraw = async () => {
+    const errs = {};
+    const aErr = Backend.validators.amount(witForm.amount, 500);
+    if (aErr) errs.amount = aErr;
+    if (!witForm.accountNum || witForm.accountNum.trim().length < 10) errs.accountNum = "Valid account number required";
+    if (!witForm.accountName || witForm.accountName.trim().length < 2) errs.accountName = "Account holder name required";
+    setWitErrs(errs);
+    if (Object.keys(errs).length) return;
+    setLoading(true);
+    await new Promise(r => setTimeout(r, 800));
+    const res = Backend.requestWithdrawal({ userId: user.id, ...witForm });
+    setLoading(false);
+    if (!res.ok) { showNotif(res.error, "error"); return; }
+    showNotif(res.message, "success");
+    setWitForm({ amount:"", accountNum:"", accountName:"", method:"EasyPaisa" });
+    refreshUser();
+  };
+
+  const inp = (label, val, onChange, type="text", err="") => (
+    <div style={{ marginBottom:14 }}>
+      <label style={{ display:"block", fontSize:11, color:"var(--muted)", letterSpacing:2, marginBottom:6 }}>{label}</label>
+      <input type={type} value={val} onChange={e => onChange(e.target.value)} placeholder={label}
+        style={{ width:"100%", background:"var(--bg2)", border:`1px solid ${err?"#ff5555":"var(--border)"}`,
+          borderRadius:10, padding:"12px 14px", color:"var(--text)", fontSize:15, outline:"none" }} />
+      <FieldError err={err} />
+    </div>
+  );
+
+  const sel = (label, val, onChange, opts) => (
+    <div style={{ marginBottom:14 }}>
+      <label style={{ display:"block", fontSize:11, color:"var(--muted)", letterSpacing:2, marginBottom:6 }}>{label}</label>
+      <select value={val} onChange={e => onChange(e.target.value)}
+        style={{ width:"100%", background:"var(--bg2)", border:"1px solid var(--border)", borderRadius:10,
+          padding:"12px 14px", color:"var(--text)", fontSize:15, outline:"none" }}>
+        {opts.map(o => <option key={o}>{o}</option>)}
+      </select>
+    </div>
+  );
+
+  return (
+    <div style={{ maxWidth:720, margin:"0 auto", padding:20 }}>
+      {/* Balance Hero */}
+      <div style={{ background:"linear-gradient(135deg,var(--card),var(--card2))", border:"1px solid var(--border)",
+        borderRadius:20, padding:30, textAlign:"center", marginBottom:20, position:"relative", overflow:"hidden" }}>
+        <div style={{ position:"absolute", inset:0, background:"radial-gradient(ellipse at center, rgba(240,192,0,.07), transparent 70%)" }} />
+        <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:3, marginBottom:8 }}>TOTAL BALANCE</div>
+        <div style={{ fontFamily:"monospace", fontSize:48, fontWeight:900, color:"var(--accent)" }}>
+          ₨{(liveUser?.balance || 0).toLocaleString("en", {minimumFractionDigits:2})}
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, marginTop:20, fontSize:13 }}>
+          {[{l:"Total Deposited",v:`₨${(liveUser?.totalDeposited||0).toLocaleString()}`,c:"var(--green)"},
+            {l:"Total Withdrawn",v:`₨${(liveUser?.totalWithdrawn||0).toLocaleString()}`,c:"var(--red)"},
+            {l:"Total Won",v:`₨${(liveUser?.totalWon||0).toLocaleString()}`,c:"var(--accent)"}].map(s => (
+            <div key={s.l} style={{ background:"rgba(255,255,255,.03)", borderRadius:10, padding:"10px 8px" }}>
+              <div style={{ color:s.c, fontFamily:"monospace", fontWeight:900, fontSize:16 }}>{s.v}</div>
+              <div style={{ color:"var(--muted)", fontSize:11, marginTop:3 }}>{s.l}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Forms */}
+      <div style={{ display:"flex", gap:0, marginBottom:20, background:"var(--card)", border:"1px solid var(--border)", borderRadius:12, overflow:"hidden" }}>
+        {["deposit","withdraw"].map(t => (
+          <div key={t} onClick={() => setTab(t)} style={{ flex:1, padding:"12px 0", textAlign:"center", cursor:"pointer",
+            fontFamily:"monospace", fontSize:13, fontWeight:700, letterSpacing:2,
+            background: tab===t ? "linear-gradient(135deg,var(--violet),#5500aa)" : "transparent",
+            color: tab===t ? "#fff" : "var(--muted)" }}>
+            {t === "deposit" ? "⬇ DEPOSIT" : "⬆ WITHDRAW"}
+          </div>
+        ))}
+      </div>
+
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:20, marginBottom:20 }}>
+        {tab === "deposit" ? (
+          <>
+            <div style={{ background:"rgba(0,176,255,.1)", border:"1px solid rgba(0,176,255,.3)", borderRadius:10, padding:"10px 14px", fontSize:13, color:"#88ddff", marginBottom:16 }}>
+              ℹ Deposit requests are reviewed by admin. Funds added after approval (usually within 1 hour).
+            </div>
+            {sel("PAYMENT METHOD", depForm.method, v => setDepForm(f=>({...f,method:v})), ["EasyPaisa","JazzCash","Bank Transfer","Crypto"])}
+            {inp("AMOUNT (min ₨100)", depForm.amount, v => { setDepForm(f=>({...f,amount:v})); setDepErrs(e=>({...e,amount:null})); }, "number", depErrs.amount)}
+            {inp("TRANSACTION REFERENCE / TXN ID", depForm.txRef, v => { setDepForm(f=>({...f,txRef:v})); setDepErrs(e=>({...e,txRef:null})); }, "text", depErrs.txRef)}
+            <button onClick={handleDeposit} disabled={loading}
+              style={{ width:"100%", padding:"14px 0", border:"none", borderRadius:10, cursor:"pointer",
+                background:"linear-gradient(135deg,var(--green),#009944)", color:"#000",
+                fontFamily:"monospace", fontSize:14, fontWeight:900, letterSpacing:2,
+                display:"flex", alignItems:"center", justifyContent:"center", opacity:loading?.7:1 }}>
+              SUBMIT DEPOSIT REQUEST{loading && <Spinner />}
+            </button>
+          </>
+        ) : (
+          <>
+            <div style={{ background:"rgba(255,23,68,.1)", border:"1px solid rgba(255,23,68,.3)", borderRadius:10, padding:"10px 14px", fontSize:13, color:"#ff9999", marginBottom:16 }}>
+              ⚠ Withdrawals processed within 24 hours. Min ₨500, max 2 requests per 5 minutes.
+            </div>
+            {inp("AMOUNT (min ₨500)", witForm.amount, v => { setWitForm(f=>({...f,amount:v})); setWitErrs(e=>({...e,amount:null})); }, "number", witErrs.amount)}
+            {sel("PAYMENT METHOD", witForm.method, v => setWitForm(f=>({...f,method:v})), ["EasyPaisa","JazzCash","Bank Transfer"])}
+            {inp("ACCOUNT NUMBER", witForm.accountNum, v => { setWitForm(f=>({...f,accountNum:v})); setWitErrs(e=>({...e,accountNum:null})); }, "text", witErrs.accountNum)}
+            {inp("ACCOUNT HOLDER NAME", witForm.accountName, v => { setWitForm(f=>({...f,accountName:v})); setWitErrs(e=>({...e,accountName:null})); }, "text", witErrs.accountName)}
+            <button onClick={handleWithdraw} disabled={loading}
+              style={{ width:"100%", padding:"14px 0", border:"none", borderRadius:10, cursor:"pointer",
+                background:"linear-gradient(135deg,#c62828,var(--red))", color:"#fff",
+                fontFamily:"monospace", fontSize:14, fontWeight:900, letterSpacing:2,
+                display:"flex", alignItems:"center", justifyContent:"center", opacity:loading?.7:1 }}>
+              SUBMIT WITHDRAWAL{loading && <Spinner />}
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Transaction History */}
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:20 }}>
+        <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:16 }}>TRANSACTION HISTORY</div>
+        {txs.length === 0 ? (
+          <div style={{ textAlign:"center", color:"var(--muted)", padding:20 }}>No transactions yet</div>
+        ) : txs.map(t => (
+          <div key={t.id} style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+            padding:"12px 0", borderBottom:"1px solid rgba(34,34,85,.5)" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+              <div style={{ width:36, height:36, borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", fontSize:16,
+                background: ["deposit","bonus","win","admin_credit"].includes(t.type) ? "rgba(0,230,118,.15)" : "rgba(255,23,68,.15)" }}>
+                {["deposit","bonus","win","admin_credit"].includes(t.type) ? "⬇️" : "⬆️"}
+              </div>
+              <div>
+                <div style={{ fontSize:14, fontWeight:600, textTransform:"capitalize" }}>{t.type.replace("_"," ")}</div>
+                <div style={{ fontSize:12, color:"var(--muted)" }}>{t.note} · {new Date(t.createdAt).toLocaleTimeString()}</div>
+              </div>
+            </div>
+            <div style={{ fontFamily:"monospace", fontWeight:900, fontSize:14,
+              color: ["deposit","bonus","win","admin_credit"].includes(t.type) ? "var(--green)" : "var(--red)" }}>
+              {["deposit","bonus","win","admin_credit"].includes(t.type) ? "+" : "-"}₨{t.amount.toLocaleString()}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// ADMIN PANEL
+// ============================================================
+function AdminPanel({ user, showNotif, refreshUser }) {
+  const [tab, setTab] = useState("dashboard");
+  const [users, setUsers] = useState([]);
+  const [adjUserId, setAdjUserId] = useState("");
+  const [adjAmt, setAdjAmt] = useState("");
+  const [adjNote, setAdjNote] = useState("");
+
+  const stats = Backend.getStats(user.id);
+  const pendingDeps = DB.pendingDeposits.filter(d => d.status === "pending");
+  const pendingWits = DB.pendingWithdrawals.filter(w => w.status === "pending");
+
+  const loadUsers = () => {
+    const res = Backend.getAllUsers(user.id);
+    if (res.ok) setUsers(res.users.filter(u => u.role !== "admin"));
+  };
+
+  useEffect(() => { if (tab === "users") loadUsers(); }, [tab]);
+
+  const handleApprove = (depId) => {
+    const res = Backend.approveDeposit({ adminId: user.id, depositId: depId });
+    if (res.ok) { showNotif(res.message, "success"); refreshUser(); }
+    else showNotif(res.error, "error");
+  };
+
+  const handleReject = (depId) => {
+    const res = Backend.rejectDeposit({ adminId: user.id, depositId: depId, reason: "Rejected by admin" });
+    if (res.ok) { showNotif(res.message, "success"); refreshUser(); }
+  };
+
+  const handleBan = (uid) => {
+    const res = Backend.banUser({ adminId: user.id, targetUserId: uid });
+    if (res.ok) { showNotif(res.message, res.newStatus === "banned" ? "warn" : "success"); loadUsers(); }
+  };
+
+  const handleAdjust = () => {
+    if (!adjUserId) { showNotif("Select user", "warn"); return; }
+    const res = Backend.adjustBalance({ adminId: user.id, targetUserId: adjUserId, amount: adjAmt, note: adjNote });
+    if (res.ok) { showNotif(`Balance updated! New: ₨${res.newBalance}`, "success"); setAdjAmt(""); setAdjNote(""); }
+    else showNotif(res.error, "error");
+  };
+
+  const tabStyle = (t) => ({
+    padding:"10px 18px", borderRadius:8, border:"none", cursor:"pointer", fontSize:13,
+    fontFamily:"monospace", fontWeight:700, letterSpacing:1,
+    background: tab===t ? "linear-gradient(135deg,var(--violet),#5500aa)" : "transparent",
+    color: tab===t ? "#fff" : "var(--muted)"
+  });
+
+  const StatBox = ({label, val, color}) => (
+    <div style={{ background:"var(--card2)", border:"1px solid var(--border)", borderRadius:12, padding:"16px 14px", textAlign:"center" }}>
+      <div style={{ fontFamily:"monospace", fontSize:22, fontWeight:900, color: color || "var(--accent)" }}>{val}</div>
+      <div style={{ color:"var(--muted)", fontSize:11, marginTop:4, letterSpacing:1 }}>{label}</div>
+    </div>
+  );
+
+  return (
+    <div style={{ maxWidth:900, margin:"0 auto", padding:20 }}>
+      <div style={{ background:"linear-gradient(135deg,#1a0030,#2a0050)", border:"1px solid rgba(176,64,255,.3)",
+        borderRadius:16, padding:"16px 20px", marginBottom:20, display:"flex", alignItems:"center", gap:12 }}>
+        <span style={{ fontSize:28 }}>🛡️</span>
+        <div>
+          <div style={{ fontFamily:"monospace", fontSize:18, fontWeight:900, color:"var(--violet)" }}>ADMIN PANEL</div>
+          <div style={{ color:"var(--muted)", fontSize:12 }}>Full access · {user.name}</div>
+        </div>
+      </div>
+
+      <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:20 }}>
+        {["dashboard","deposits","withdrawals","users","adjust"].map(t => (
+          <button key={t} style={tabStyle(t)} onClick={() => { setTab(t); if(t==="users") loadUsers(); }}>
+            {t.toUpperCase()}
+            {t==="deposits" && pendingDeps.length > 0 && <span style={{ marginLeft:6, background:"var(--red)", borderRadius:99, fontSize:10, padding:"1px 6px" }}>{pendingDeps.length}</span>}
+            {t==="withdrawals" && pendingWits.length > 0 && <span style={{ marginLeft:6, background:"var(--accent)", color:"#000", borderRadius:99, fontSize:10, padding:"1px 6px" }}>{pendingWits.length}</span>}
+          </button>
+        ))}
+      </div>
+
+      {tab === "dashboard" && stats.ok && (
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12 }}>
+          <StatBox label="TOTAL USERS" val={stats.stats.totalUsers} color="var(--blue)" />
+          <StatBox label="ACTIVE" val={stats.stats.activeUsers} color="var(--green)" />
+          <StatBox label="BANNED" val={stats.stats.bannedUsers} color="var(--red)" />
+          <StatBox label="TOTAL BETS" val={stats.stats.totalBets} color="var(--violet)" />
+          <StatBox label="PENDING DEP" val={stats.stats.pendingDeposits} color="var(--accent)" />
+          <StatBox label="PENDING WIT" val={stats.stats.pendingWithdrawals} color="var(--accent)" />
+          <StatBox label="HOUSE PROFIT" val={`₨${Math.floor(stats.stats.houseProfit).toLocaleString()}`} color="var(--green)" />
+          <StatBox label="TOTAL BALANCE" val={`₨${Math.floor(stats.stats.totalBalance).toLocaleString()}`} color="var(--accent)" />
+        </div>
+      )}
+
+      {tab === "deposits" && (
+        <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:20 }}>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:16 }}>PENDING DEPOSITS ({pendingDeps.length})</div>
+          {pendingDeps.length === 0 ? <div style={{ textAlign:"center", color:"var(--muted)", padding:20 }}>No pending deposits</div> : (
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead><tr>{["ID","USER","AMOUNT","METHOD","TX REF","TIME","ACTION"].map(h => (
+                <th key={h} style={{ padding:"8px 6px", textAlign:"left", color:"var(--muted)", fontSize:11, borderBottom:"1px solid var(--border)" }}>{h}</th>
+              ))}</tr></thead>
+              <tbody>{pendingDeps.map(d => {
+                const u = Object.values(DB.users).find(x => x.id === d.userId);
+                return (
+                  <tr key={d.id}>
+                    <td style={{ padding:"10px 6px", fontSize:11 }}>{d.id}</td>
+                    <td style={{ padding:"10px 6px" }}>{u?.name || "?"}</td>
+                    <td style={{ padding:"10px 6px", color:"var(--green)", fontWeight:900 }}>₨{d.amount.toLocaleString()}</td>
+                    <td style={{ padding:"10px 6px" }}>{d.method}</td>
+                    <td style={{ padding:"10px 6px", fontSize:11, color:"var(--muted)" }}>{d.txRef}</td>
+                    <td style={{ padding:"10px 6px", fontSize:11 }}>{new Date(d.createdAt).toLocaleTimeString()}</td>
+                    <td style={{ padding:"10px 6px" }}>
+                      <button onClick={() => handleApprove(d.id)} style={{ marginRight:6, padding:"5px 10px", borderRadius:6, border:"none", cursor:"pointer", background:"var(--green)", color:"#000", fontSize:11, fontWeight:700 }}>✓ Approve</button>
+                      <button onClick={() => handleReject(d.id)} style={{ padding:"5px 10px", borderRadius:6, border:"none", cursor:"pointer", background:"var(--red)", color:"#fff", fontSize:11, fontWeight:700 }}>✕ Reject</button>
+                    </td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {tab === "withdrawals" && (
+        <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:20 }}>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:16 }}>PENDING WITHDRAWALS ({pendingWits.length})</div>
+          {pendingWits.length === 0 ? <div style={{ textAlign:"center", color:"var(--muted)", padding:20 }}>No pending withdrawals</div> : (
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead><tr>{["ID","USER","AMOUNT","METHOD","ACCOUNT","TIME"].map(h => (
+                <th key={h} style={{ padding:"8px 6px", textAlign:"left", color:"var(--muted)", fontSize:11, borderBottom:"1px solid var(--border)" }}>{h}</th>
+              ))}</tr></thead>
+              <tbody>{pendingWits.map(w => {
+                const u = Object.values(DB.users).find(x => x.id === w.userId);
+                return (
+                  <tr key={w.id}>
+                    <td style={{ padding:"10px 6px", fontSize:11 }}>{w.id}</td>
+                    <td style={{ padding:"10px 6px" }}>{u?.name || "?"}</td>
+                    <td style={{ padding:"10px 6px", color:"var(--red)", fontWeight:900 }}>₨{w.amount.toLocaleString()}</td>
+                    <td style={{ padding:"10px 6px" }}>{w.method}</td>
+                    <td style={{ padding:"10px 6px", fontSize:11 }}>{w.accountNum} ({w.accountName})</td>
+                    <td style={{ padding:"10px 6px", fontSize:11 }}>{new Date(w.createdAt).toLocaleTimeString()}</td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {tab === "users" && (
+        <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:20 }}>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:16 }}>ALL USERS ({users.length})</div>
+          {users.length === 0 ? <div style={{ textAlign:"center", color:"var(--muted)", padding:20 }}>No users registered yet</div> : (
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead><tr>{["ID","NAME","USERNAME","PHONE","BALANCE","BETS","STATUS","ACTION"].map(h => (
+                <th key={h} style={{ padding:"8px 6px", textAlign:"left", color:"var(--muted)", fontSize:11, borderBottom:"1px solid var(--border)" }}>{h}</th>
+              ))}</tr></thead>
+              <tbody>{users.map(u => (
+                <tr key={u.id}>
+                  <td style={{ padding:"10px 6px", fontSize:11 }}>{u.id}</td>
+                  <td style={{ padding:"10px 6px" }}>{u.name}</td>
+                  <td style={{ padding:"10px 6px", color:"var(--muted)" }}>{u.username}</td>
+                  <td style={{ padding:"10px 6px", fontSize:11 }}>{u.phone}</td>
+                  <td style={{ padding:"10px 6px", color:"var(--accent)", fontFamily:"monospace", fontWeight:700 }}>₨{(u.balance||0).toLocaleString()}</td>
+                  <td style={{ padding:"10px 6px" }}>{u.totalBets?.toLocaleString() || 0}</td>
+                  <td style={{ padding:"10px 6px" }}>
+                    <span style={{ padding:"3px 8px", borderRadius:99, fontSize:11, fontWeight:700,
+                      background: u.status==="active" ? "rgba(0,230,118,.2)" : "rgba(255,23,68,.2)",
+                      color: u.status==="active" ? "var(--green)" : "var(--red)" }}>
+                      {u.status?.toUpperCase()}
+                    </span>
+                  </td>
+                  <td style={{ padding:"10px 6px" }}>
+                    <button onClick={() => handleBan(u.id)} style={{ padding:"5px 10px", borderRadius:6, border:"none", cursor:"pointer",
+                      background: u.status==="banned" ? "var(--green)" : "var(--red)", color: u.status==="banned"?"#000":"#fff", fontSize:11, fontWeight:700 }}>
+                      {u.status==="banned" ? "Unban" : "Ban"}
+                    </button>
+                  </td>
+                </tr>
+              ))}</tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {tab === "adjust" && (
+        <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:20 }}>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:20 }}>ADJUST USER BALANCE</div>
+          <div style={{ marginBottom:14 }}>
+            <label style={{ display:"block", fontSize:11, color:"var(--muted)", letterSpacing:2, marginBottom:6 }}>SELECT USER</label>
+            <select value={adjUserId} onChange={e => setAdjUserId(e.target.value)}
+              style={{ width:"100%", background:"var(--bg2)", border:"1px solid var(--border)", borderRadius:10, padding:"12px 14px", color:"var(--text)", fontSize:15, outline:"none" }}>
+              <option value="">-- Select User --</option>
+              {Object.values(DB.users).filter(u=>u.role!=="admin").map(u => (
+                <option key={u.id} value={u.id}>{u.name} ({u.username}) — ₨{(u.balance||0).toLocaleString()}</option>
+              ))}
+            </select>
+          </div>
+          <div style={{ marginBottom:14 }}>
+            <label style={{ display:"block", fontSize:11, color:"var(--muted)", letterSpacing:2, marginBottom:6 }}>AMOUNT (+ to add, - to deduct)</label>
+            <input type="number" value={adjAmt} onChange={e => setAdjAmt(e.target.value)} placeholder="e.g. 500 or -200"
+              style={{ width:"100%", background:"var(--bg2)", border:"1px solid var(--border)", borderRadius:10, padding:"12px 14px", color:"var(--text)", fontSize:15, outline:"none" }} />
+          </div>
+          <div style={{ marginBottom:16 }}>
+            <label style={{ display:"block", fontSize:11, color:"var(--muted)", letterSpacing:2, marginBottom:6 }}>NOTE</label>
+            <input type="text" value={adjNote} onChange={e => setAdjNote(e.target.value)} placeholder="Reason for adjustment"
+              style={{ width:"100%", background:"var(--bg2)", border:"1px solid var(--border)", borderRadius:10, padding:"12px 14px", color:"var(--text)", fontSize:15, outline:"none" }} />
+          </div>
+          <button onClick={handleAdjust} style={{ width:"100%", padding:"14px 0", border:"none", borderRadius:10, cursor:"pointer",
+            background:"linear-gradient(135deg,var(--accent),#cc9900)", color:"#000", fontFamily:"monospace", fontSize:14, fontWeight:900, letterSpacing:2 }}>
+            APPLY ADJUSTMENT
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// GAME CHART (SVG-based, no library needed)
+// ============================================================
+function GameChart({ userId }) {
+  const [view, setView] = useState("results"); // results | pnl | colors
+
+  const myBets = DB.bets.filter(b => b.userId === userId && b.status === "settled").slice(-30);
+  const allResults = DB.gameResults.slice(0, 30).reverse();
+
+  // Build P&L over time
+  let running = 0;
+  const pnlData = myBets.map((b, i) => {
+    running += b.won ? b.winAmount - b.amount : -b.amount;
+    return { x: i, y: running, won: b.won, period: b.period };
+  });
+
+  // Color frequency from all results
+  const colorCount = { green: 0, red: 0, violet: 0 };
+  allResults.forEach(r => {
+    const c = r.result === 0 || r.result === 5 ? "violet" : [1,3,7,9].includes(r.result) ? "green" : "red";
+    colorCount[c]++;
+  });
+
+  // Number frequency
+  const numCount = Array(10).fill(0);
+  allResults.forEach(r => numCount[r.result]++);
+
+  const W = 560, H = 160, PAD = 30;
+
+  // SVG P&L line chart
+  function PnLChart() {
+    if (pnlData.length < 2) return (
+      <div style={{ height:160, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--muted)", fontSize:13 }}>
+        Place at least 2 bets to see P&L chart
+      </div>
+    );
+    const minY = Math.min(0, ...pnlData.map(d => d.y));
+    const maxY = Math.max(0, ...pnlData.map(d => d.y));
+    const rangeY = maxY - minY || 1;
+    const toX = i => PAD + (i / (pnlData.length - 1)) * (W - PAD * 2);
+    const toY = v => H - PAD - ((v - minY) / rangeY) * (H - PAD * 2);
+    const zeroY = toY(0);
+
+    const points = pnlData.map((d, i) => `${toX(i)},${toY(d.y)}`).join(" ");
+    const areaPoints = `${toX(0)},${zeroY} ${points} ${toX(pnlData.length-1)},${zeroY}`;
+    const last = pnlData[pnlData.length - 1];
+    const isPos = last.y >= 0;
+
+    return (
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ overflow:"visible" }}>
+        <defs>
+          <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={isPos ? "#00e676" : "#ff1744"} stopOpacity="0.25" />
+            <stop offset="100%" stopColor={isPos ? "#00e676" : "#ff1744"} stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        {/* Zero line */}
+        <line x1={PAD} y1={zeroY} x2={W - PAD} y2={zeroY} stroke="#333366" strokeWidth="1" strokeDasharray="4,4" />
+        {/* Area */}
+        <polygon points={areaPoints} fill="url(#pnlGrad)" />
+        {/* Line */}
+        <polyline points={points} fill="none" stroke={isPos ? "#00e676" : "#ff1744"} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+        {/* Dots */}
+        {pnlData.map((d, i) => (
+          <circle key={i} cx={toX(i)} cy={toY(d.y)} r="4"
+            fill={d.won ? "#00e676" : "#ff1744"} stroke="var(--bg)" strokeWidth="2" />
+        ))}
+        {/* Labels */}
+        <text x={PAD} y={H - 4} fill="#6666aa" fontSize="10">{pnlData[0]?.period}</text>
+        <text x={W - PAD} y={H - 4} fill="#6666aa" fontSize="10" textAnchor="end">{last?.period}</text>
+        <text x={W - PAD + 4} y={toY(last.y) + 4} fill={isPos?"#00e676":"#ff1744"} fontSize="11" fontWeight="bold">
+          {last.y >= 0 ? "+" : ""}₨{Math.round(last.y)}
+        </text>
+      </svg>
+    );
+  }
+
+  // Bar chart for results
+  function ResultsChart() {
+    const data = allResults.slice(-20);
+    if (data.length === 0) return <div style={{ height:160, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--muted)", fontSize:13 }}>No results yet</div>;
+    const BW = Math.min(22, (W - PAD * 2) / data.length - 3);
+    const colorFill = { green:"#00e676", red:"#ff1744", violet:"#b040ff" };
+    const getC = n => n === 0 || n === 5 ? "violet" : [1,3,7,9].includes(n) ? "green" : "red";
+
+    return (
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
+        {data.map((r, i) => {
+          const c = getC(r.result);
+          const bh = 20 + r.result * 10;
+          const x = PAD + i * ((W - PAD * 2) / data.length) + (((W - PAD * 2) / data.length) - BW) / 2;
+          const y = H - PAD - bh;
+          return (
+            <g key={i}>
+              <rect x={x} y={y} width={BW} height={bh} rx="4"
+                fill={colorFill[c]} opacity="0.85" />
+              <text x={x + BW/2} y={y - 4} textAnchor="middle" fill={colorFill[c]} fontSize="11" fontWeight="bold">{r.result}</text>
+            </g>
+          );
+        })}
+        <line x1={PAD} y1={H-PAD} x2={W-PAD} y2={H-PAD} stroke="#333366" strokeWidth="1" />
+      </svg>
+    );
+  }
+
+  // Donut chart for color distribution
+  function ColorDonut() {
+    const total = colorCount.green + colorCount.red + colorCount.violet || 1;
+    const data = [
+      { label:"Green", count:colorCount.green, color:"#00e676", pct: colorCount.green/total },
+      { label:"Red",   count:colorCount.red,   color:"#ff1744", pct: colorCount.red/total },
+      { label:"Violet",count:colorCount.violet,color:"#b040ff", pct: colorCount.violet/total },
+    ];
+    const cx = 80, cy = 80, r = 55, inner = 30;
+    let startAngle = -Math.PI / 2;
+    const slices = data.map(d => {
+      const angle = d.pct * 2 * Math.PI;
+      const x1 = cx + r * Math.cos(startAngle), y1 = cy + r * Math.sin(startAngle);
+      const x2 = cx + r * Math.cos(startAngle + angle), y2 = cy + r * Math.sin(startAngle + angle);
+      const ix1 = cx + inner * Math.cos(startAngle), iy1 = cy + inner * Math.sin(startAngle);
+      const ix2 = cx + inner * Math.cos(startAngle + angle), iy2 = cy + inner * Math.sin(startAngle + angle);
+      const large = angle > Math.PI ? 1 : 0;
+      const path = `M ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} L ${ix2} ${iy2} A ${inner} ${inner} 0 ${large} 0 ${ix1} ${iy1} Z`;
+      const mid = startAngle + angle / 2;
+      startAngle += angle;
+      return { ...d, path, mid };
+    });
+
+    return (
+      <div style={{ display:"flex", alignItems:"center", gap:20 }}>
+        <svg width="160" height="160" viewBox="0 0 160 160">
+          {slices.map((s, i) => <path key={i} d={s.path} fill={s.color} opacity="0.9" />)}
+          <text x={cx} y={cy+5} textAnchor="middle" fill="var(--text)" fontSize="13" fontWeight="bold">{total}</text>
+          <text x={cx} y={cy+18} textAnchor="middle" fill="var(--muted)" fontSize="9">ROUNDS</text>
+        </svg>
+        <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+          {slices.map(s => (
+            <div key={s.label} style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <div style={{ width:12, height:12, borderRadius:"50%", background:s.color }} />
+              <span style={{ fontSize:13, color:"var(--text)" }}>{s.label}</span>
+              <span style={{ fontSize:13, fontWeight:700, color:s.color }}>{s.count}</span>
+              <span style={{ fontSize:11, color:"var(--muted)" }}>({Math.round(s.pct*100)}%)</span>
+            </div>
+          ))}
+          <div style={{ fontSize:11, color:"var(--muted)", marginTop:4 }}>Last {total} rounds</div>
+        </div>
+      </div>
+    );
+  }
+
+  // Number frequency bar
+  function NumFreq() {
+    const max = Math.max(...numCount, 1);
+    const getC = n => n === 0 || n === 5 ? "#b040ff" : [1,3,7,9].includes(n) ? "#00e676" : "#ff1744";
+    return (
+      <div style={{ display:"flex", gap:6, alignItems:"flex-end", height:100 }}>
+        {numCount.map((cnt, n) => (
+          <div key={n} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+            <div style={{ fontSize:10, color:getC(n), fontWeight:700 }}>{cnt}</div>
+            <div style={{ width:"100%", borderRadius:"4px 4px 0 0", background:getC(n), opacity:.85,
+              height: `${Math.max(4, (cnt/max)*70)}px`, transition:"height .5s" }} />
+            <div style={{ fontSize:11, fontWeight:900, color:getC(n) }}>{n}</div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  const tabs = [
+    { id:"results", label:"📈 Results" },
+    { id:"pnl", label:"💹 My P&L" },
+    { id:"colors", label:"🎨 Colors" },
+    { id:"numbers", label:"🔢 Numbers" },
+  ];
+
+  return (
+    <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:16, marginBottom:16 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14, flexWrap:"wrap", gap:8 }}>
+        <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2 }}>GAME CHART</div>
+        <div style={{ display:"flex", gap:4, flexWrap:"wrap" }}>
+          {tabs.map(t => (
+            <button key={t.id} onClick={() => setView(t.id)}
+              style={{ padding:"5px 12px", borderRadius:8, border:`1px solid ${view===t.id?"var(--accent)":"var(--border)"}`,
+                background: view===t.id ? "rgba(240,192,0,.12)" : "var(--bg2)", cursor:"pointer",
+                color: view===t.id ? "var(--accent)" : "var(--muted)", fontSize:11, fontWeight:700 }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div style={{ overflowX:"auto" }}>
+        {view === "results" && <ResultsChart />}
+        {view === "pnl" && <PnLChart />}
+        {view === "colors" && <ColorDonut />}
+        {view === "numbers" && <NumFreq />}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// USER PANEL PAGE (full stats dashboard for player)
+// ============================================================
+function UserPanel({ user, setPage }) {
+  const liveUser = Object.values(DB.users).find(u => u.id === user.id) || user;
+  const myBets = DB.bets.filter(b => b.userId === user.id && b.status === "settled");
+  const pending = DB.bets.filter(b => b.userId === user.id && b.status === "pending");
+  const myTxs = Backend.getUserTransactions(user.id).slice(0, 5);
+  const myDeps = DB.pendingDeposits.filter(d => d.userId === user.id);
+  const myWits = DB.pendingWithdrawals.filter(w => w.userId === user.id);
+
+  const totalWagered = myBets.reduce((s,b) => s + b.amount, 0);
+  const totalWon = myBets.filter(b=>b.won).reduce((s,b) => s + b.winAmount, 0);
+  const netPnL = totalWon - totalWagered;
+  const winRate = myBets.length > 0 ? Math.round((myBets.filter(b=>b.won).length / myBets.length)*100) : 0;
+  const biggestWin = myBets.filter(b=>b.won).reduce((max,b) => b.winAmount > max ? b.winAmount : max, 0);
+  const streak = (() => {
+    let s = 0; let type = null;
+    for (let b of [...myBets].reverse()) {
+      if (type === null) { type = b.won; s = 1; }
+      else if (b.won === type) s++;
+      else break;
+    }
+    return { count: s, won: type };
+  })();
+
+  const colorBets = myBets.filter(b=>b.betType==="color");
+  const favColor = (() => {
+    const cnt = { green:0, red:0, violet:0 };
+    colorBets.forEach(b => cnt[b.betValue]++);
+    return Object.entries(cnt).sort((a,b)=>b[1]-a[1])[0];
+  })();
+
+  const Card = ({children, style={}}) => (
+    <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:14, padding:18, ...style }}>
+      {children}
+    </div>
+  );
+
+  const StatRow = ({icon, label, val, color}) => (
+    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:"1px solid rgba(34,34,85,.5)" }}>
+      <span style={{ display:"flex", alignItems:"center", gap:8, color:"var(--muted)", fontSize:13 }}>
+        <span>{icon}</span>{label}
+      </span>
+      <span style={{ fontFamily:"monospace", fontWeight:900, fontSize:13, color: color||"var(--text)" }}>{val}</span>
+    </div>
+  );
+
+  return (
+    <div style={{ maxWidth:900, margin:"0 auto", padding:20 }}>
+
+      {/* Welcome Header */}
+      <div style={{ background:"linear-gradient(135deg,#0a001a,#1a0040)", border:"1px solid rgba(176,64,255,.3)",
+        borderRadius:18, padding:"22px 24px", marginBottom:20, display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:16 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:16 }}>
+          <div style={{ width:56, height:56, borderRadius:"50%", border:"2px solid var(--accent)",
+            background:"linear-gradient(135deg,var(--violet),var(--accent))", display:"flex", alignItems:"center",
+            justifyContent:"center", fontSize:22, fontWeight:900, flexShrink:0 }}>
+            {liveUser.name.charAt(0).toUpperCase()}
+          </div>
+          <div>
+            <div style={{ fontFamily:"monospace", fontSize:20, fontWeight:900 }}>Welcome, {liveUser.name}!</div>
+            <div style={{ color:"var(--muted)", fontSize:12, marginTop:3 }}>{liveUser.id} · Joined {new Date(liveUser.createdAt).toLocaleDateString()}</div>
+          </div>
+        </div>
+        <div style={{ textAlign:"right" }}>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2 }}>YOUR BALANCE</div>
+          <div style={{ fontFamily:"monospace", fontSize:28, fontWeight:900, color:"var(--accent)" }}>
+            ₨{Math.floor(liveUser.balance||0).toLocaleString()}
+          </div>
+          <div style={{ display:"flex", gap:8, marginTop:8, justifyContent:"flex-end" }}>
+            <button onClick={() => setPage("wallet")} style={{ padding:"7px 16px", borderRadius:8, border:"none", cursor:"pointer",
+              background:"linear-gradient(135deg,var(--green),#009944)", color:"#000", fontSize:12, fontWeight:700 }}>
+              ⬇ Deposit
+            </button>
+            <button onClick={() => setPage("game")} style={{ padding:"7px 16px", borderRadius:8, border:"none", cursor:"pointer",
+              background:"linear-gradient(135deg,var(--accent),#cc9900)", color:"#000", fontSize:12, fontWeight:700 }}>
+              🎮 Play
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Top Stats Grid */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:20 }}>
+        {[
+          { label:"TOTAL BETS", val: myBets.length, color:"var(--blue)", icon:"🎯" },
+          { label:"WIN RATE", val: winRate+"%", color: winRate>=50?"var(--green)":"var(--red)", icon:"📊" },
+          { label:"NET P&L", val: `${netPnL>=0?"+":""}₨${Math.round(netPnL).toLocaleString()}`, color: netPnL>=0?"var(--green)":"var(--red)", icon:"💹" },
+          { label:"BIGGEST WIN", val: `₨${biggestWin.toLocaleString()}`, color:"var(--accent)", icon:"🏆" },
+        ].map(s => (
+          <Card key={s.label} style={{ textAlign:"center", padding:"16px 10px" }}>
+            <div style={{ fontSize:22, marginBottom:6 }}>{s.icon}</div>
+            <div style={{ fontFamily:"monospace", fontSize:20, fontWeight:900, color:s.color }}>{s.val}</div>
+            <div style={{ color:"var(--muted)", fontSize:10, marginTop:4, letterSpacing:1 }}>{s.label}</div>
+          </Card>
+        ))}
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:20 }}>
+        {/* Detailed Stats */}
+        <Card>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:4 }}>📈 DETAILED STATS</div>
+          <StatRow icon="💰" label="Total Wagered" val={`₨${totalWagered.toLocaleString()}`} color="var(--accent)" />
+          <StatRow icon="🏆" label="Total Won" val={`₨${totalWon.toLocaleString()}`} color="var(--green)" />
+          <StatRow icon="📉" label="Total Lost" val={`₨${(totalWagered - myBets.filter(b=>b.won).reduce((s,b)=>s+b.amount,0)).toLocaleString()}`} color="var(--red)" />
+          <StatRow icon="💳" label="Total Deposited" val={`₨${(liveUser.totalDeposited||0).toLocaleString()}`} />
+          <StatRow icon="⬆" label="Total Withdrawn" val={`₨${(liveUser.totalWithdrawn||0).toLocaleString()}`} />
+          <div style={{ paddingBottom:4 }} />
+        </Card>
+
+        {/* Streaks & Preferences */}
+        <Card>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2, marginBottom:4 }}>🔥 STREAKS & STYLE</div>
+          <StatRow icon="🔥" label="Current Streak" val={myBets.length > 0 ? `${streak.count}x ${streak.won?"WIN":"LOSS"}` : "—"} color={streak.won?"var(--green)":"var(--red)"} />
+          <StatRow icon="🎨" label="Favourite Color" val={favColor ? `${favColor[0].toUpperCase()} (${favColor[1]}x)` : "—"} />
+          <StatRow icon="📱" label="Pending Bets" val={pending.length} color="var(--accent)" />
+          <StatRow icon="⏳" label="Pending Deposits" val={myDeps.filter(d=>d.status==="pending").length} color="var(--accent)" />
+          <StatRow icon="⏳" label="Pending Withdrawals" val={myWits.filter(w=>w.status==="pending").length} color="var(--accent)" />
+          <div style={{ paddingBottom:4 }} />
+        </Card>
+      </div>
+
+      {/* Game Chart */}
+      <GameChart userId={user.id} />
+
+      {/* Recent Transactions */}
+      <Card>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+          <div style={{ color:"var(--muted)", fontSize:11, letterSpacing:2 }}>💳 RECENT TRANSACTIONS</div>
+          <button onClick={() => setPage("wallet")} style={{ background:"none", border:"none", color:"var(--accent)", cursor:"pointer", fontSize:12, fontWeight:700 }}>View All →</button>
+        </div>
+        {myTxs.length === 0 ? (
+          <div style={{ textAlign:"center", color:"var(--muted)", padding:20, fontSize:13 }}>No transactions yet</div>
+        ) : myTxs.map(t => (
+          <div key={t.id} style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+            padding:"10px 0", borderBottom:"1px solid rgba(34,34,85,.4)" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+              <span style={{ fontSize:18 }}>{["deposit","bonus","win","admin_credit"].includes(t.type)?"⬇️":"⬆️"}</span>
+              <div>
+                <div style={{ fontSize:13, fontWeight:600, textTransform:"capitalize" }}>{t.type.replace("_"," ")}</div>
+                <div style={{ fontSize:11, color:"var(--muted)" }}>{t.note} · {new Date(t.createdAt).toLocaleTimeString()}</div>
+              </div>
+            </div>
+            <div style={{ fontFamily:"monospace", fontWeight:900, fontSize:13,
+              color:["deposit","bonus","win","admin_credit"].includes(t.type)?"var(--green)":"var(--red)" }}>
+              {["deposit","bonus","win","admin_credit"].includes(t.type)?"+":"-"}₨{t.amount.toLocaleString()}
+            </div>
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
+}
+
+
+function HistoryPage({ user }) {
+  const [filter, setFilter] = useState("all"); // all | won | lost
+  const [betTypeFilter, setBetTypeFilter] = useState("all"); // all | color | number
+  const [page, setPage] = useState(1);
+  const PER_PAGE = 15;
+
+  const allBets = DB.bets
+    .filter(b => b.userId === user.id && b.status === "settled")
+    .slice()
+    .reverse();
+
+  const filtered = allBets.filter(b => {
+    if (filter === "won" && !b.won) return false;
+    if (filter === "lost" && b.won) return false;
+    if (betTypeFilter === "color" && b.betType !== "color") return false;
+    if (betTypeFilter === "number" && b.betType !== "number") return false;
+    return true;
+  });
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PER_PAGE));
+  const paginated = filtered.slice((page - 1) * PER_PAGE, page * PER_PAGE);
+
+  // Stats
+  const settled = allBets;
+  const totalWagered = settled.reduce((s, b) => s + b.amount, 0);
+  const totalWon = settled.filter(b => b.won).reduce((s, b) => s + b.winAmount, 0);
+  const totalLost = settled.filter(b => !b.won).reduce((s, b) => s + b.amount, 0);
+  const winCount = settled.filter(b => b.won).length;
+  const winRate = settled.length > 0 ? Math.round((winCount / settled.length) * 100) : 0;
+  const netPnL = totalWon - totalWagered;
+
+  // Color distribution
+  const colorBets = settled.filter(b => b.betType === "color");
+  const colorDist = { green: 0, red: 0, violet: 0 };
+  colorBets.forEach(b => { colorDist[b.betValue] = (colorDist[b.betValue] || 0) + 1; });
+
+  const colorMap = {
+    green: "linear-gradient(135deg,#00b341,#00e676)",
+    red: "linear-gradient(135deg,#a80000,#ff1744)",
+    violet: "linear-gradient(135deg,#6a00bb,#b040ff)"
+  };
+  const numColor = (n) => n === 0 || n === 5 ? "violet" : [1,3,7,9].includes(n) ? "green" : "red";
+
+  const StatBox = ({ label, val, color, sub }) => (
+    <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:14, padding:"16px 14px", textAlign:"center" }}>
+      <div style={{ fontFamily:"monospace", fontSize:20, fontWeight:900, color: color || "var(--accent)" }}>{val}</div>
+      {sub && <div style={{ fontFamily:"monospace", fontSize:11, color:"var(--muted)", marginTop:2 }}>{sub}</div>}
+      <div style={{ color:"var(--muted)", fontSize:11, marginTop:4, letterSpacing:1 }}>{label}</div>
+    </div>
+  );
+
+  const FBtn = ({ label, val, cur, onClick }) => (
+    <button onClick={onClick}
+      style={{ padding:"7px 14px", borderRadius:8, border:`1px solid ${cur===val?"var(--accent)":"var(--border)"}`,
+        background: cur===val ? "rgba(240,192,0,.12)" : "var(--bg2)",
+        color: cur===val ? "var(--accent)" : "var(--muted)", cursor:"pointer",
+        fontSize:12, fontWeight:700, letterSpacing:1 }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div style={{ maxWidth:860, margin:"0 auto", padding:20 }}>
+
+      {/* Summary Stats */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:20 }}>
+        <StatBox label="TOTAL BETS" val={settled.length} color="var(--blue)" />
+        <StatBox label="WIN RATE" val={winRate + "%"} color={winRate >= 50 ? "var(--green)" : "var(--red)"} />
+        <StatBox label="TOTAL WAGERED" val={`₨${totalWagered.toLocaleString()}`} color="var(--accent)" />
+        <StatBox label="NET P&L" val={`${netPnL >= 0 ? "+" : ""}₨${netPnL.toLocaleString()}`}
+          color={netPnL >= 0 ? "var(--green)" : "var(--red)"} />
+      </div>
+
+      {/* Win/Loss bar */}
+      {settled.length > 0 && (
+        <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:14, padding:16, marginBottom:20 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+            <span style={{ color:"var(--green)", fontSize:13, fontWeight:700 }}>🏆 Won: {winCount} (₨{totalWon.toLocaleString()})</span>
+            <span style={{ color:"var(--red)", fontSize:13, fontWeight:700 }}>💸 Lost: {settled.length - winCount} (₨{totalLost.toLocaleString()})</span>
+          </div>
+          <div style={{ height:10, borderRadius:99, background:"var(--bg2)", overflow:"hidden" }}>
+            <div style={{ height:"100%", width: `${winRate}%`, background:"linear-gradient(90deg,var(--green),#00c853)",
+              borderRadius:99, transition:"width .5s", minWidth: winRate > 0 ? 4 : 0 }} />
+          </div>
+          {/* Color distribution */}
+          {colorBets.length > 0 && (
+            <div style={{ display:"flex", gap:10, marginTop:14, flexWrap:"wrap" }}>
+              {["green","red","violet"].map(c => (
+                colorDist[c] > 0 && (
+                  <div key={c} style={{ display:"flex", alignItems:"center", gap:6, background:"rgba(255,255,255,.04)",
+                    borderRadius:8, padding:"6px 12px" }}>
+                    <div style={{ width:10, height:10, borderRadius:"50%", background:colorMap[c] }} />
+                    <span style={{ fontSize:12, color:"var(--muted)", textTransform:"capitalize" }}>{c}</span>
+                    <span style={{ fontSize:12, fontWeight:700, color:"var(--text)" }}>{colorDist[c]}</span>
+                  </div>
+                )
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Filters */}
+      <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:16, alignItems:"center" }}>
+        <span style={{ color:"var(--muted)", fontSize:12, letterSpacing:1 }}>RESULT:</span>
+        <FBtn label="All" val="all" cur={filter} onClick={() => { setFilter("all"); setPage(1); }} />
+        <FBtn label="✅ Won" val="won" cur={filter} onClick={() => { setFilter("won"); setPage(1); }} />
+        <FBtn label="❌ Lost" val="lost" cur={filter} onClick={() => { setFilter("lost"); setPage(1); }} />
+        <span style={{ color:"var(--muted)", fontSize:12, letterSpacing:1, marginLeft:8 }}>TYPE:</span>
+        <FBtn label="All" val="all" cur={betTypeFilter} onClick={() => { setBetTypeFilter("all"); setPage(1); }} />
+        <FBtn label="🎨 Color" val="color" cur={betTypeFilter} onClick={() => { setBetTypeFilter("color"); setPage(1); }} />
+        <FBtn label="🔢 Number" val="number" cur={betTypeFilter} onClick={() => { setBetTypeFilter("number"); setPage(1); }} />
+      </div>
+
+      {/* Table */}
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, overflow:"hidden" }}>
+        <div style={{ padding:"14px 20px", borderBottom:"1px solid var(--border)", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <span style={{ color:"var(--muted)", fontSize:11, letterSpacing:2 }}>
+            SHOWING {filtered.length === 0 ? 0 : (page-1)*PER_PAGE+1}–{Math.min(page*PER_PAGE, filtered.length)} OF {filtered.length}
+          </span>
+          <span style={{ color:"var(--muted)", fontSize:11 }}>Page {page}/{totalPages}</span>
+        </div>
+
+        {paginated.length === 0 ? (
+          <div style={{ textAlign:"center", color:"var(--muted)", padding:40, fontSize:14 }}>
+            {allBets.length === 0 ? "No bets yet — go play WinGo!" : "No bets match this filter"}
+          </div>
+        ) : (
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead>
+                <tr style={{ background:"var(--bg2)" }}>
+                  {["PERIOD","TYPE","SELECTION","AMOUNT","RESULT","COLOR","P&L","TIME"].map(h => (
+                    <th key={h} style={{ padding:"10px 12px", textAlign:"left", color:"var(--muted)", fontSize:11,
+                      letterSpacing:1, borderBottom:"1px solid var(--border)", whiteSpace:"nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {paginated.map((b, i) => {
+                  const rc = b.resultColor || numColor(b.result);
+                  return (
+                    <tr key={b.id} style={{ background: i % 2 === 0 ? "transparent" : "rgba(255,255,255,.015)",
+                      borderBottom:"1px solid rgba(34,34,85,.4)" }}>
+                      <td style={{ padding:"11px 12px", fontFamily:"monospace", fontSize:11, color:"var(--muted)" }}>{b.period}</td>
+                      <td style={{ padding:"11px 12px" }}>
+                        <span style={{ padding:"2px 8px", borderRadius:99, fontSize:11, fontWeight:700,
+                          background: b.betType==="color" ? "rgba(176,64,255,.15)" : "rgba(0,176,255,.15)",
+                          color: b.betType==="color" ? "var(--violet)" : "var(--blue)" }}>
+                          {b.betType === "color" ? "COLOR" : "NUMBER"}
+                        </span>
+                      </td>
+                      <td style={{ padding:"11px 12px" }}>
+                        {b.betType === "color" ? (
+                          <span style={{ display:"inline-flex", alignItems:"center", gap:6 }}>
+                            <span style={{ width:10, height:10, borderRadius:"50%", background:colorMap[b.betValue], flexShrink:0 }} />
+                            <span style={{ fontWeight:700, textTransform:"capitalize" }}>{b.betValue}</span>
+                          </span>
+                        ) : (
+                          <span style={{ fontFamily:"monospace", fontSize:16, fontWeight:900,
+                            color: numColor(b.betValue)==="green"?"var(--green)":numColor(b.betValue)==="red"?"var(--red)":"var(--violet)" }}>
+                            {b.betValue}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ padding:"11px 12px", fontFamily:"monospace", fontWeight:700 }}>₨{b.amount.toLocaleString()}</td>
+                      <td style={{ padding:"11px 12px" }}>
+                        <div style={{ width:28, height:28, borderRadius:"50%", display:"inline-flex", alignItems:"center",
+                          justifyContent:"center", background:colorMap[rc], color: rc==="green"?"#000":"#fff",
+                          fontFamily:"monospace", fontSize:13, fontWeight:900 }}>
+                          {b.result}
+                        </div>
+                      </td>
+                      <td style={{ padding:"11px 12px" }}>
+                        <span style={{ display:"inline-flex", alignItems:"center", gap:5 }}>
+                          <span style={{ width:8, height:8, borderRadius:"50%", background:colorMap[rc] }} />
+                          <span style={{ fontSize:11, textTransform:"capitalize", color:"var(--muted)" }}>{rc}</span>
+                        </span>
+                      </td>
+                      <td style={{ padding:"11px 12px", fontFamily:"monospace", fontWeight:900,
+                        color: b.won ? "var(--green)" : "var(--red)" }}>
+                        {b.won ? `+₨${b.winAmount.toLocaleString()}` : `-₨${b.amount.toLocaleString()}`}
+                      </td>
+                      <td style={{ padding:"11px 12px", fontSize:11, color:"var(--muted)", whiteSpace:"nowrap" }}>
+                        {new Date(b.settledAt || b.createdAt).toLocaleTimeString()}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Pagination */}
+        {totalPages > 1 && (
+          <div style={{ padding:"14px 20px", borderTop:"1px solid var(--border)", display:"flex", gap:8, justifyContent:"center" }}>
+            <button onClick={() => setPage(1)} disabled={page===1}
+              style={{ padding:"6px 12px", borderRadius:8, border:"1px solid var(--border)", cursor:page===1?"not-allowed":"pointer",
+                background:"var(--bg2)", color:page===1?"var(--muted)":"var(--text)", fontSize:12 }}>«</button>
+            <button onClick={() => setPage(p => Math.max(1, p-1))} disabled={page===1}
+              style={{ padding:"6px 12px", borderRadius:8, border:"1px solid var(--border)", cursor:page===1?"not-allowed":"pointer",
+                background:"var(--bg2)", color:page===1?"var(--muted)":"var(--text)", fontSize:12 }}>‹ Prev</button>
+            {Array.from({length:Math.min(5,totalPages)}, (_,i) => {
+              const p = Math.max(1, Math.min(page-2, totalPages-4)) + i;
+              return p <= totalPages ? (
+                <button key={p} onClick={() => setPage(p)}
+                  style={{ padding:"6px 12px", borderRadius:8, border:`1px solid ${p===page?"var(--accent)":"var(--border)"}`,
+                    cursor:"pointer", background:p===page?"rgba(240,192,0,.15)":"var(--bg2)",
+                    color:p===page?"var(--accent)":"var(--text)", fontSize:12, fontWeight:p===page?900:400 }}>{p}</button>
+              ) : null;
+            })}
+            <button onClick={() => setPage(p => Math.min(totalPages, p+1))} disabled={page===totalPages}
+              style={{ padding:"6px 12px", borderRadius:8, border:"1px solid var(--border)", cursor:page===totalPages?"not-allowed":"pointer",
+                background:"var(--bg2)", color:page===totalPages?"var(--muted)":"var(--text)", fontSize:12 }}>Next ›</button>
+            <button onClick={() => setPage(totalPages)} disabled={page===totalPages}
+              style={{ padding:"6px 12px", borderRadius:8, border:"1px solid var(--border)", cursor:page===totalPages?"not-allowed":"pointer",
+                background:"var(--bg2)", color:page===totalPages?"var(--muted)":"var(--text)", fontSize:12 }}>»</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PROFILE PAGE
+// ============================================================
+function ProfilePage({ user, showNotif, onLogout }) {
+  const liveUser = Object.values(DB.users).find(u => u.id === user.id) || user;
+  const winRate = liveUser.gamesWon > 0 && liveUser.totalBets > 0
+    ? Math.round((liveUser.gamesWon / Math.max(DB.bets.filter(b=>b.userId===user.id&&b.status==="settled").length, 1)) * 100)
+    : 0;
+
+  const Row = ({icon, label, val}) => (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 0", borderBottom:"1px solid var(--border)" }}>
+      <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+        <span style={{ fontSize:18 }}>{icon}</span>
+        <span style={{ fontSize:14, color:"var(--muted)" }}>{label}</span>
+      </div>
+      <span style={{ fontFamily:"monospace", fontWeight:700, color:"var(--text)" }}>{val}</span>
+    </div>
+  );
+
+  return (
+    <div style={{ maxWidth:600, margin:"0 auto", padding:20 }}>
+      <div style={{ background:"linear-gradient(135deg,var(--card),var(--card2))", border:"1px solid var(--border)",
+        borderRadius:20, padding:30, display:"flex", alignItems:"center", gap:20, marginBottom:20, flexWrap:"wrap" }}>
+        <div style={{ width:72, height:72, borderRadius:"50%", border:"2px solid var(--accent)",
+          background:"linear-gradient(135deg,var(--violet),var(--accent))", display:"flex", alignItems:"center",
+          justifyContent:"center", fontSize:28, fontWeight:900, flexShrink:0 }}>
+          {liveUser.name.charAt(0).toUpperCase()}
+        </div>
+        <div>
+          <div style={{ fontFamily:"monospace", fontSize:22, fontWeight:900 }}>{liveUser.name}</div>
+          <div style={{ color:"var(--muted)", fontSize:13, marginTop:4 }}>@{liveUser.username} · {liveUser.id}</div>
+          <div style={{ marginTop:8, display:"inline-flex", alignItems:"center", gap:6,
+            background: liveUser.role==="admin" ? "rgba(176,64,255,.15)" : "rgba(240,192,0,.1)",
+            border:`1px solid ${liveUser.role==="admin" ? "var(--violet)" : "var(--accent)"}`,
+            borderRadius:20, padding:"4px 12px", fontSize:12, color: liveUser.role==="admin" ? "var(--violet)" : "var(--accent)", fontWeight:700 }}>
+            {liveUser.role==="admin" ? "🛡️ ADMIN" : "⭐ VIP USER"}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12, marginBottom:20 }}>
+        {[{l:"BALANCE",v:`₨${Math.floor(liveUser.balance||0).toLocaleString()}`,c:"var(--accent)"},
+          {l:"GAMES WON",v:liveUser.gamesWon||0,c:"var(--green)"},
+          {l:"WIN RATE",v:winRate+"%",c:"var(--blue)"}].map(s => (
+          <div key={s.l} style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:14, padding:18, textAlign:"center" }}>
+            <div style={{ fontFamily:"monospace", fontSize:22, fontWeight:900, color:s.c }}>{s.v}</div>
+            <div style={{ color:"var(--muted)", fontSize:11, marginTop:4, letterSpacing:1 }}>{s.l}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:16, padding:"0 20px", marginBottom:20 }}>
+        <Row icon="📱" label="Phone" val={liveUser.phone} />
+        <Row icon="📅" label="Joined" val={new Date(liveUser.createdAt).toLocaleDateString()} />
+        <Row icon="💸" label="Total Deposited" val={`₨${(liveUser.totalDeposited||0).toLocaleString()}`} />
+        <Row icon="🏆" label="Total Won" val={`₨${(liveUser.totalWon||0).toLocaleString()}`} />
+        <Row icon="🎯" label="Total Wagered" val={`₨${Math.floor(liveUser.totalBets||0).toLocaleString()}`} />
+        <div style={{ paddingBottom:14 }}></div>
+      </div>
+
+      <button onClick={onLogout} style={{ width:"100%", padding:"15px 0", border:"1px solid var(--red)",
+        borderRadius:12, background:"rgba(255,23,68,.1)", color:"var(--red)", cursor:"pointer",
+        fontFamily:"monospace", fontSize:14, fontWeight:900, letterSpacing:2 }}>
+        🚪 LOGOUT
+      </button>
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+function App() {
+  const [session, setSession] = useState(null); // { user, token }
+  const [page, setPage] = useState("game");
+  const [notif, setNotif] = useState(null);
+  const notifTimer = useRef(null);
+
+  const showNotif = useCallback((msg, type = "info") => {
+    setNotif({ msg, type });
+    clearTimeout(notifTimer.current);
+    notifTimer.current = setTimeout(() => setNotif(null), 3500);
+  }, []);
+
+  const refreshUser = useCallback(() => {
+    if (!session) return;
+    const updated = Backend._safeUser(Object.values(DB.users).find(u => u.id === session.user.id));
+    setSession(s => ({ ...s, user: updated }));
+  }, [session]);
+
+  const handleLogin = (user, token) => {
+    setSession({ user, token });
+    setPage(user.role === "admin" ? "admin" : "panel");
+    showNotif(user.role === "admin" ? "🛡️ Admin access granted!" : `✅ Welcome back, ${user.name}!`, "success");
+  };
+
+  const handleLogout = () => {
+    setSession(null);
+    setPage("game");
+    showNotif("Logged out successfully", "info");
+  };
+
+  if (!session) return (
+    <>
+      <style>{S.vars}{`
+        @keyframes slideIn { from{transform:translateX(100%);opacity:0} to{transform:translateX(0);opacity:1} }
+        @keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+      `}</style>
+      <Notif notif={notif} />
+      <AuthPage onLogin={handleLogin} />
+    </>
+  );
+
+  const { user } = session;
+  const navItems = user.role === "admin"
+    ? [{ id:"admin", label:"🛡️ Admin" }, { id:"panel", label:"🏠 Panel" }, { id:"game", label:"🎮 Game" }, { id:"history", label:"📊 History" }, { id:"wallet", label:"💰 Wallet" }, { id:"profile", label:"👤 Profile" }]
+    : [{ id:"panel", label:"🏠 Panel" }, { id:"game", label:"🎮 Game" }, { id:"history", label:"📊 History" }, { id:"wallet", label:"💰 Wallet" }, { id:"profile", label:"👤 Profile" }];
+
+  return (
+    <>
+      <style>{S.vars}{`
+        @keyframes slideIn { from{transform:translateX(100%);opacity:0} to{transform:translateX(0);opacity:1} }
+        @keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+      `}</style>
+      <Notif notif={notif} />
+
+      {/* Nav */}
+      <div style={{ position:"sticky", top:0, zIndex:100, background:"rgba(7,7,26,.97)", backdropFilter:"blur(20px)",
+        borderBottom:"1px solid var(--border)", padding:"0 20px", display:"flex", alignItems:"center",
+        justifyContent:"space-between", height:58 }}>
+        <div style={{ fontFamily:"monospace", fontSize:20, fontWeight:900, letterSpacing:4,
+          background:"linear-gradient(135deg,var(--accent),var(--violet))", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>
+          WINGO
+        </div>
+        <div style={{ display:"flex", gap:4 }}>
+          {navItems.map(n => (
+            <button key={n.id} onClick={() => setPage(n.id)}
+              style={{ padding:"7px 14px", borderRadius:8, border:"none", cursor:"pointer", fontSize:13,
+                background: page===n.id ? "var(--card2)" : "transparent",
+                color: page===n.id ? "var(--text)" : "var(--muted)", fontWeight:700, transition:"all .2s" }}>
+              {n.label}
+            </button>
+          ))}
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ background:"var(--card)", border:"1px solid var(--border)", borderRadius:10,
+            padding:"6px 12px", fontFamily:"monospace", fontSize:13, color:"var(--accent)", fontWeight:900, cursor:"pointer" }}
+            onClick={() => setPage("wallet")}>
+            ₨{Math.floor(Object.values(DB.users).find(u=>u.id===user.id)?.balance||0).toLocaleString()}
+          </div>
+          <div style={{ width:34, height:34, borderRadius:"50%", border:`2px solid ${user.role==="admin"?"var(--violet)":"var(--accent)"}`,
+            background:"linear-gradient(135deg,var(--violet),var(--accent))", display:"flex", alignItems:"center",
+            justifyContent:"center", fontWeight:900, cursor:"pointer" }} onClick={() => setPage("profile")}>
+            {user.name.charAt(0).toUpperCase()}
+          </div>
+        </div>
+      </div>
+
+      {/* Pages */}
+      {page === "panel" && <UserPanel user={user} setPage={setPage} />}
+      {page === "game" && <GamePage user={user} token={session.token} showNotif={showNotif} refreshUser={refreshUser} />}
+      {page === "history" && <HistoryPage user={user} />}
+      {page === "wallet" && <WalletPage user={user} showNotif={showNotif} refreshUser={refreshUser} />}
+      {page === "profile" && <ProfilePage user={user} showNotif={showNotif} onLogout={handleLogout} />}
+      {page === "admin" && user.role === "admin" && <AdminPanel user={user} showNotif={showNotif} refreshUser={refreshUser} />}
+    </>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
